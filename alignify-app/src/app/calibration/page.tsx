@@ -1,42 +1,300 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
-import { useSearchParams, useRouter } from "next/navigation";
-import Layout from "@/components/Layout";
-import { useAuth } from "@/contexts/AuthContext";
-import { db } from "@/lib/firebase";
-import firebase from "firebase/compat/app";
-import "firebase/compat/storage";
-import "firebase/compat/firestore";
-import { FilesetResolver, PoseLandmarker } from "@mediapipe/tasks-vision";
+import React, { useState, useEffect, useRef } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import Layout from '@/components/Layout';
+import { useAuth } from '@/contexts/AuthContext';
+import firebase from 'firebase/compat/app';
+import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
+import { db, storage } from '@/lib/firebase';
 
-export default function Calibration() {
-  const searchParams = useSearchParams();
+export default function CalibrationPage() {
   const router = useRouter();
+  const searchParams = useSearchParams();
+  const planId = searchParams.get('planId');
   const { currentUser } = useAuth();
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
-  const animationFrameRef = useRef<number | null>(null);
-
-  // Get plan ID and workout count from URL parameters
-  const planId = searchParams.get("planId");
-  const workoutCount = parseInt(searchParams.get("workoutCount") || "1");
-
-  // State for the calibration process
+  
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>("");
+  const [planDetails, setPlanDetails] = useState<any>(null);
+  const [workoutCount, setWorkoutCount] = useState(3);
   const [currentStep, setCurrentStep] = useState(1);
-  const [isCapturing, setIsCapturing] = useState(false);
-  const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [workoutName, setWorkoutName] = useState("");
-  const [plan, setPlan] = useState<any>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [isCapturing, setIsCapturing] = useState(false);
   const [countdown, setCountdown] = useState(10);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isMPReady, setIsMPReady] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const poseLandmarkerRef = useRef<any>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  
+  // Load plan details on mount
+  useEffect(() => {
+    if (!planId || !currentUser) {
+      console.log("Initial auth check:", {
+        planId,
+        isUserAuthenticated: !!currentUser,
+        userId: currentUser?.uid
+      });
+      
+      if (!planId) {
+        setError("Missing plan ID in URL parameters");
+        setLoading(false);
+      } else if (!currentUser) {
+        setError("You must be signed in to use this feature");
+        setLoading(false);
+      }
+      
+      return;
+    }
+    
+    const fetchPlanDetails = async () => {
+      try {
+        console.log("Fetching plan details for:", {
+          planId,
+          userId: currentUser.uid
+        });
+        
+        const docRef = db.collection('users').doc(currentUser.uid)
+          .collection('plans').doc(planId);
+        
+        const doc = await docRef.get();
+        
+        if (doc.exists) {
+          console.log("Plan details found:", doc.data());
+          setPlanDetails(doc.data());
+          if (doc.data()?.workoutCount) {
+            setWorkoutCount(doc.data()?.workoutCount);
+          }
+        } else {
+          console.error("Plan document not found");
+          setError("Plan not found");
+        }
+        
+        setLoading(false);
+      } catch (err) {
+        console.error("Error fetching plan:", err);
+        setError("Failed to fetch plan details");
+        setLoading(false);
+      }
+    };
+    
+    fetchPlanDetails();
+  }, [planId, currentUser]);
+  
+  // Initialize MediaPipe and webcam on mount
+  useEffect(() => {
+    let mounted = true;
+    let stream: MediaStream | null = null;
+    
+    const initMediaPipe = async () => {
+      try {
+        // Initialize FilesetResolver
+        console.log("Initializing MediaPipe and camera...");
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm"
+        );
+        
+        if (!mounted) return;
+        
+        // Initialize PoseLandmarker
+        poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(
+          vision,
+          {
+            baseOptions: {
+              modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+              delegate: "GPU"
+            },
+            runningMode: "VIDEO",
+            numPoses: 1,
+            minPoseDetectionConfidence: 0.5,
+            minPosePresenceConfidence: 0.5,
+            minTrackingConfidence: 0.5,
+            outputSegmentationMasks: false
+          }
+        );
+        
+        if (!mounted) return;
+        setIsMPReady(true);
+        console.log("MediaPipe initialized successfully");
+        
+        // Now initialize the camera separately
+        await initCamera();
+      } catch (err: any) {
+        console.error("Error initializing MediaPipe:", err);
+        setCameraError(err.message || "Error initializing MediaPipe");
+        setLoading(false);
+      }
+    };
+    
+    const initCamera = async () => {
+      if (!mounted) return;
+      
+      try {
+        console.log("Initializing camera...");
+        // First make sure any existing stream is properly cleaned up
+        if (videoRef.current?.srcObject) {
+          const oldStream = videoRef.current.srcObject as MediaStream;
+          oldStream.getTracks().forEach(track => track.stop());
+          videoRef.current.srcObject = null;
+          // Brief pause to let cleanup happen
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        
+        if (!mounted) return;
+        
+        // Request camera with specific constraints
+        const constraints = {
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        };
+        
+        console.log("Requesting camera access with constraints:", constraints);
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        
+        if (!mounted || !videoRef.current) return;
+        
+        // Set the stream to the video element
+        videoRef.current.srcObject = stream;
+        console.log("Stream assigned to video element");
+        
+        // Clear any previous event handlers
+        videoRef.current.onloadedmetadata = null;
+        videoRef.current.onplaying = null;
+        
+        // Set up event handlers
+        videoRef.current.onloadedmetadata = () => {
+          console.log("Video metadata loaded, dimensions:", 
+            videoRef.current?.videoWidth, "x", videoRef.current?.videoHeight);
+          
+          if (!mounted || !videoRef.current) return;
+          
+          // Play the video after metadata is loaded
+          videoRef.current.play().then(() => {
+            console.log("Video playing successfully");
+            if (!mounted) return;
+            
+            // Only set up canvas and start detection after video is actually playing
+            setupCanvas();
+            startPoseDetection();
+            setLoading(false);
+          }).catch(e => {
+            console.error("Error playing video:", e);
+            setCameraError("Could not start video playback. Please check camera permissions and try again.");
+            setLoading(false);
+          });
+        };
+        
+        // Handle errors
+        videoRef.current.onerror = (e) => {
+          console.error("Video element error:", e);
+          setCameraError("Video element encountered an error. Please refresh and try again.");
+          setLoading(false);
+        };
+      } catch (err: any) {
+        console.error("Error accessing camera:", err);
+        setCameraError(err.message || "Error accessing camera");
+        setLoading(false);
+      }
+    };
+    
+    // Start the initialization process
+    initMediaPipe();
+    
+    // Cleanup function
+    return () => {
+      console.log("Cleaning up camera resources...");
+      mounted = false;
+      
+      // Stop the camera stream
+      if (stream) {
+        stream.getTracks().forEach(track => {
+          console.log("Stopping camera track:", track.kind, track.id);
+          track.stop();
+        });
+      }
+      
+      // Stop any ongoing animation frames
+      if (animationFrameRef.current) {
+        console.log("Cancelling animation frame:", animationFrameRef.current);
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
+      // Clear the video element
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+        videoRef.current.onloadedmetadata = null;
+        videoRef.current.onplaying = null;
+        videoRef.current.onerror = null;
+      }
+    };
+  }, []);
+  
+  // Clean up animation frame on unmount
+  useEffect(() => {
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+    };
+  }, []);
+  
+  const setupCanvas = () => {
+    if (!videoRef.current || !canvasRef.current) {
+      console.error("Video or canvas element not available for setup");
+      return;
+    }
+    
+    // Wait for video to be fully loaded with dimensions
+    if (videoRef.current.readyState < 2) {
+      console.log("Video not ready for canvas setup, will retry");
+      setTimeout(setupCanvas, 100);
+      return;
+    }
+    
+    // Set canvas dimensions to match video
+    const videoWidth = videoRef.current.videoWidth || videoRef.current.clientWidth;
+    const videoHeight = videoRef.current.videoHeight || videoRef.current.clientHeight;
+    
+    if (videoWidth <= 0 || videoHeight <= 0) {
+      console.warn("Invalid video dimensions for canvas setup, will retry");
+      setTimeout(setupCanvas, 100);
+      return;
+    }
+    
+    try {
+      // Set canvas dimensions
+      canvasRef.current.width = videoWidth;
+      canvasRef.current.height = videoHeight;
+      
+      console.log(`Canvas dimensions set to ${canvasRef.current.width}x${canvasRef.current.height}`);
+      
+      // Draw a test rectangle to verify canvas is working
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+        ctx.fillRect(20, 20, 60, 60);
+        ctx.fillStyle = 'white';
+        ctx.font = '14px Arial';
+        ctx.fillText('Canvas Ready', 25, 50);
+      } else {
+        console.error("Could not get canvas context");
+      }
+    } catch (err) {
+      console.error("Error setting up canvas:", err);
+    }
+  };
 
-  // Draw pose landmarks
-  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: any) => {
+  // Draw pose landmarks manually using canvas API
+  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: any[]) => {
     landmarks.forEach((landmark: any) => {
       ctx.beginPath();
       const mirroredX = ctx.canvas.width - (landmark.x * ctx.canvas.width);
@@ -50,7 +308,7 @@ export default function Calibration() {
   };
 
   // Draw connections between landmarks
-  const drawConnections = (ctx: CanvasRenderingContext2D, landmarks: any) => {
+  const drawConnections = (ctx: CanvasRenderingContext2D, landmarks: any[]) => {
     const connections = [
       // Torso
       [11, 12], [12, 24], [24, 23], [23, 11],
@@ -65,235 +323,161 @@ export default function Calibration() {
     ];
 
     ctx.strokeStyle = '#00FF00';
-    ctx.lineWidth = 4;
+    ctx.lineWidth = 3;
 
     connections.forEach(([start, end]) => {
       if (landmarks[start] && landmarks[end]) {
         const startX = ctx.canvas.width - (landmarks[start].x * ctx.canvas.width);
+        const startY = landmarks[start].y * ctx.canvas.height;
         const endX = ctx.canvas.width - (landmarks[end].x * ctx.canvas.width);
+        const endY = landmarks[end].y * ctx.canvas.height;
         
         ctx.beginPath();
-        ctx.moveTo(startX, landmarks[start].y * ctx.canvas.height);
-        ctx.lineTo(endX, landmarks[end].y * ctx.canvas.height);
+        ctx.moveTo(startX, startY);
+        ctx.lineTo(endX, endY);
         ctx.stroke();
       }
     });
   };
-
-  // Initialize webcam and plan
-  useEffect(() => {
-    if (!planId || !currentUser) {
-      router.push("/plans");
+  
+  const processFrame = async () => {
+    if (!videoRef.current || !canvasRef.current || !poseLandmarkerRef.current) {
+      // If essential elements are missing, keep the loop running anyway
+      console.log("Essential elements missing for pose detection, will retry");
+      animationFrameRef.current = requestAnimationFrame(processFrame);
       return;
     }
 
-    // Fetch plan details
-    const fetchPlan = async () => {
-      try {
-        const planDoc = await db.collection('users').doc(currentUser.uid)
-          .collection('plans').doc(planId).get();
-        
-        if (!planDoc.exists) {
-          throw new Error("Plan not found");
-        }
+    // Check if video is ready and has valid dimensions
+    if (videoRef.current.readyState < 2 || 
+        videoRef.current.videoWidth <= 0 || 
+        videoRef.current.videoHeight <= 0) {
+      console.log("Video not ready yet or has invalid dimensions, waiting...");
+      animationFrameRef.current = requestAnimationFrame(processFrame);
+      return;
+    }
 
-        setPlan(planDoc.data());
-      } catch (err) {
-        console.error("Error fetching plan:", err);
-        setError("Failed to load plan details");
-      }
-    };
-
-    fetchPlan();
-
-    // Initialize MediaPipe
-    const initializeMediaPipe = async () => {
-      try {
-        console.log("Initializing MediaPipe...");
-        
-        // Initialize MediaPipe FilesetResolver
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm"
-        );
-        
-        console.log("FilesetResolver created successfully");
-        
-        // Create PoseLandmarker with specific model path
-        const poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-            delegate: "GPU" // Use GPU for better performance
-          },
-          runningMode: "VIDEO",
-          numPoses: 1,
-          minPoseDetectionConfidence: 0.5,
-          minPosePresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5
-        });
-        
-        // Store the poseLandmarker
-        poseLandmarkerRef.current = poseLandmarker;
-        console.log("PoseLandmarker initialized successfully");
-        setIsMPReady(true);
-      } catch (error) {
-        console.error("Error initializing PoseLandmarker:", error);
-        setCameraError("Failed to initialize pose detection. Please refresh the page.");
-      }
-    };
-
-    initializeMediaPipe();
-    
-    return () => {
-      // Stop animation frame
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = null;
-      }
-    };
-  }, [planId, currentUser, router]);
-
-  // Separate useEffect for camera initialization
-  useEffect(() => {
-    if (loading && !isMPReady) return;
-
-    const initCamera = async () => {
-      try {
-        if (!videoRef.current) return;
-        
-        setCameraError(null);
-        
-        // Stop any existing stream
-        if (videoRef.current.srcObject) {
-          const stream = videoRef.current.srcObject as MediaStream;
-          stream.getTracks().forEach(track => track.stop());
-        }
-        
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { 
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            facingMode: "user" 
-          }
-        });
-        
-        videoRef.current.srcObject = stream;
-        // Add event listener for when video is ready
-        videoRef.current.onloadedmetadata = () => {
-          if (videoRef.current) {
-            videoRef.current.play().catch(e => {
-              console.error("Error playing video:", e);
-              setCameraError("Could not start video playback");
-            });
-            
-            // Start the pose detection when video starts playing
-            if (isMPReady && !capturedImage) {
-              startPoseDetection();
-            }
-            
-            setLoading(false);
-          }
-        };
-      } catch (err) {
-        console.error("Error accessing camera:", err);
-        setCameraError("Camera access is required for calibration. Please allow camera access and reload this page.");
-        setLoading(false);
-      }
-    };
-
-    initCamera();
-
-    // Cleanup
-    return () => {
-      if (videoRef.current && videoRef.current.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
+    try {
+      const canvasCtx = canvasRef.current.getContext('2d');
+      if (!canvasCtx) {
+        animationFrameRef.current = requestAnimationFrame(processFrame);
+        return;
       }
       
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
-      }
-    };
-  }, [loading, isMPReady, capturedImage]);
-
-  const processFrame = async () => {
-    if (!poseLandmarkerRef.current || !videoRef.current || !canvasRef.current || capturedImage) {
-      return;
-    }
-    
-    const canvasCtx = canvasRef.current.getContext('2d');
-    if (!canvasCtx) {
-      animationFrameRef.current = requestAnimationFrame(processFrame);
-      return;
-    }
-    
-    // Make sure video is ready
-    if (videoRef.current.readyState < 2) {
-      animationFrameRef.current = requestAnimationFrame(processFrame);
-      return;
-    }
-    
-    try {
-      // Clear canvas first
+      // Clear the canvas first
       canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
       
-      // Set canvas dimensions if they're not already set
-      if (canvasRef.current.width !== videoRef.current.videoWidth || 
-          canvasRef.current.height !== videoRef.current.videoHeight) {
-        canvasRef.current.width = videoRef.current.videoWidth;
-        canvasRef.current.height = videoRef.current.videoHeight;
-      }
-      
-      // Draw video frame first (mirrored)
+      // Save the canvas state
       canvasCtx.save();
-      canvasCtx.translate(canvasRef.current.width, 0);
+      
+      // Flip the canvas horizontally for correct mirroring
       canvasCtx.scale(-1, 1);
+      canvasCtx.translate(-canvasRef.current.width, 0);
+      
+      // Draw the video frame onto the canvas
       canvasCtx.drawImage(
         videoRef.current, 
         0, 0, 
         canvasRef.current.width, 
         canvasRef.current.height
       );
+      
+      // Restore the canvas state for drawing landmarks without flipping them again
       canvasCtx.restore();
+      
+      // Draw a test rectangle and text
+      canvasCtx.fillStyle = 'rgba(255, 0, 0, 0.1)';
+      canvasCtx.fillRect(10, 10, 200, 40);
+      canvasCtx.fillStyle = 'white';
+      canvasCtx.font = '20px Arial';
+      canvasCtx.fillText('Canvas Active', 20, 35);
       
       // Get current timestamp
       const startTimeMs = performance.now();
       
-      // Get results from pose detection
-      const results = await poseLandmarkerRef.current.detectForVideo(videoRef.current, startTimeMs);
-      
-      // Draw pose landmarks if available
-      if (results.landmarks && results.landmarks.length > 0) {
-        const landmarks = results.landmarks[0];
-        drawConnections(canvasCtx, landmarks);
-        drawLandmarks(canvasCtx, landmarks);
+      // Make sure video dimensions are valid before detection
+      if (videoRef.current.videoWidth > 0 && videoRef.current.videoHeight > 0) {
+        // Get results from pose detection
+        const results = await poseLandmarkerRef.current.detectForVideo(videoRef.current, startTimeMs);
+        
+        // Draw pose landmarks if available
+        if (results.landmarks && results.landmarks.length > 0) {
+          const landmarks = results.landmarks[0];
+          drawConnections(canvasCtx, landmarks);
+          drawLandmarks(canvasCtx, landmarks);
+        }
+      } else {
+        console.warn("Invalid video dimensions, skipping pose detection");
       }
     } catch (error) {
       console.error("Error during pose detection:", error);
+      // Don't let errors stop the animation loop
     }
     
-    // Continue the detection loop if not capturing
-    if (!isCapturing && !capturedImage) {
+    // CRITICAL: only stop the animation loop when we have a captured image
+    // AND we're not in the middle of a transition between steps
+    if (capturedImage && !isSubmitting) {
+      console.log("Stopping animation loop - image captured");
+    } else {
+      // Continue the animation loop
       animationFrameRef.current = requestAnimationFrame(processFrame);
     }
   };
 
   const startPoseDetection = () => {
+    console.log("Starting pose detection animation loop");
+    
+    // Always cancel any existing animation frame first
     if (animationFrameRef.current) {
+      console.log("Canceling existing animation frame:", animationFrameRef.current);
       cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
     }
-    processFrame();
+    
+    // Add a DOM attribute to help track state (redundancy mechanism)
+    if (videoRef.current) {
+      videoRef.current.setAttribute('data-detection-active', 'true');
+    }
+    
+    // Make sure video is playing
+    if (videoRef.current && videoRef.current.paused) {
+      console.log("Video was paused, attempting to play");
+      videoRef.current.play().catch(e => {
+        console.error("Error playing video in startPoseDetection:", e);
+      });
+    }
+    
+    // Start a new animation frame
+    console.log("Requesting new animation frame for pose detection");
+    animationFrameRef.current = requestAnimationFrame(processFrame);
   };
 
   const captureImage = () => {
-    if (!videoRef.current || !canvasRef.current) return;
+    if (!videoRef.current || !canvasRef.current) {
+      console.error("Video or canvas not available for capture");
+      return;
+    }
     
+    // Prevent multiple capturing sessions
+    if (isCapturing) {
+      console.warn("Already capturing, ignoring request");
+      return;
+    }
+    
+    console.log("Starting image capture with countdown");
     setIsCapturing(true);
     setCountdown(10); // Reset countdown to 10 seconds
     
-    // Continue pose detection during countdown
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
+    // Make sure video is playing and pose detection is active
+    if (videoRef.current.paused) {
+      console.log("Video was paused, playing before capture");
+      videoRef.current.play().catch(err => 
+        console.error("Error playing video for capture:", err)
+      );
     }
+    
+    // Ensure the animation frame is running
+    console.log("Ensuring pose detection is running during countdown");
     startPoseDetection();
     
     // Countdown for 10 seconds before capture
@@ -302,19 +486,50 @@ export default function Calibration() {
         const newCount = prev - 1;
         
         if (newCount <= 0) {
+          console.log("Countdown complete, capturing image");
           clearInterval(countdownInterval);
           
-          // Stop animation frame before capture
-          if (animationFrameRef.current) {
-            cancelAnimationFrame(animationFrameRef.current);
-            animationFrameRef.current = null;
+          try {
+            // Make sure we have the latest frame
+            if (!canvasRef.current) {
+              throw new Error("Canvas not available at capture time");
+            }
+            
+            // Capture image from canvas (which already has pose landmarks drawn)
+            const imageDataUrl = canvasRef.current.toDataURL('image/png');
+            if (!imageDataUrl || imageDataUrl === 'data:,') {
+              throw new Error("Failed to capture image data from canvas");
+            }
+            
+            console.log("Image captured successfully");
+            setCapturedImage(imageDataUrl);
+            
+            // Stop the animation frame now that we have an image
+            if (animationFrameRef.current) {
+              console.log("Stopping animation frame after capture");
+              cancelAnimationFrame(animationFrameRef.current);
+              animationFrameRef.current = null;
+            }
+            
+            // Indicate capture is complete
+            setIsCapturing(false);
+          } catch (error) {
+            console.error("Error during image capture:", error);
+            setIsCapturing(false);
+            // If there was an error capturing, we should keep the animation frame running
+            if (!animationFrameRef.current) {
+              startPoseDetection();
+            }
           }
           
-          // Capture image from canvas (which already has pose landmarks drawn)
-          const imageDataUrl = canvasRef.current?.toDataURL('image/png') || null;
-          setCapturedImage(imageDataUrl);
-          setIsCapturing(false);
           return 0;
+        }
+        
+        // Force refresh the animation frame periodically during countdown
+        // to ensure it doesn't stall
+        if (newCount % 3 === 0) {
+          console.log(`Refreshing animation frame at countdown ${newCount}`);
+          startPoseDetection();
         }
         
         return newCount;
@@ -322,29 +537,187 @@ export default function Calibration() {
     }, 1000);
   };
 
-  const retakeImage = () => {
+  const retakeImage = async () => {
+    console.log("Retaking image, cleaning up previous state");
+    
+    // Prevent multiple simultaneous retake attempts
+    if (isCapturing) {
+      console.warn("Already capturing, ignoring retake request");
+      return;
+    }
+    
+    // Don't cancel animation frame during retake - it should continue
+    console.log("Clearing captured image for retake");
+    
+    // Clear the captured image
     setCapturedImage(null);
     
-    // Restart the camera and pose detection
-    setTimeout(() => {
-      if (isMPReady) {
-        startPoseDetection();
+    // Brief pause to let state update
+    await new Promise(resolve => setTimeout(resolve, 50));
+    
+    // Make sure animation is running
+    if (!animationFrameRef.current) {
+      console.log("No animation frame during retake, restarting detection");
+      startPoseDetection();
+    } else {
+      console.log("Animation frame already running during retake");
+    }
+  };
+
+  // Moving to the next step in calibration
+  const moveToNextStep = async (nextStep: number) => {
+    console.log(`Preparing to move to step ${nextStep} of ${workoutCount}`);
+    
+    try {
+      // Update state first
+      setCurrentStep(nextStep);
+      
+      // Clear captured image
+      setCapturedImage(null);
+      
+      // Draw a simple message on canvas to indicate transition
+      if (canvasRef.current) {
+        const ctx = canvasRef.current.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+          ctx.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+          ctx.fillStyle = 'white';
+          ctx.font = '24px Arial';
+          ctx.textAlign = 'center';
+          ctx.fillText('Setting up next step...', canvasRef.current.width/2, canvasRef.current.height/2);
+        }
       }
-    }, 500);
+      
+      // We DO need to restart the video stream here for the next step
+      console.log("Explicitly restarting video feed for next step");
+      
+      // Stop any existing animation frame - we'll restart it after video is ready
+      if (animationFrameRef.current) {
+        console.log("Canceling animation frame before restart:", animationFrameRef.current);
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
+      // Restart the video - this is critical for step transitions
+      const videoRestarted = await restartVideo();
+      
+      if (videoRestarted) {
+        console.log("Video successfully restarted for next step");
+        // Already handled in the restartVideo function
+      } else {
+        console.error("Failed to restart video for next step");
+        // Try a fallback approach - just reinitialize the camera directly
+        console.log("Attempting fallback camera initialization");
+        
+        try {
+          // Stop any existing streams
+          if (videoRef.current?.srcObject) {
+            const oldStream = videoRef.current.srcObject as MediaStream;
+            oldStream.getTracks().forEach(track => track.stop());
+            videoRef.current.srcObject = null;
+          }
+          
+          // Request a new stream
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              facingMode: "user",
+              width: { ideal: 1280 },
+              height: { ideal: 720 }
+            }
+          });
+          
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            videoRef.current.play().catch(err => {
+              console.error("Error playing video in fallback:", err);
+            });
+          }
+        } catch (err) {
+          console.error("Fallback camera initialization failed:", err);
+        }
+      }
+      
+      // Reset loading and submitting state
+      setLoading(false);
+      setIsSubmitting(false);
+    } catch (error) {
+      console.error("Error moving to next step:", error);
+      setCameraError("An error occurred while moving to the next step. Please refresh and try again.");
+      setLoading(false);
+      setIsSubmitting(false);
+    }
   };
 
   const saveWorkout = async () => {
-    if (!planId || !currentUser || !capturedImage || !workoutName) return;
+    // Add debugging to check required fields
+    console.log("Save workout triggered with:", {
+      planId,
+      hasUser: !!currentUser,
+      userId: currentUser?.uid,
+      hasImage: !!capturedImage,
+      imageLength: capturedImage ? capturedImage.substring(0, 20) + "..." : "null",
+      workoutName,
+      isSubmitting
+    });
+    
+    if (!planId) {
+      console.error("Missing planId");
+      setError("Missing plan ID. Please try again.");
+      return;
+    }
+    
+    if (!currentUser) {
+      console.error("No user is signed in");
+      setError("You must be signed in to save workouts.");
+      return;
+    }
+    
+    if (!capturedImage) {
+      console.error("No image captured");
+      setError("Please capture an image before saving.");
+      return;
+    }
+    
+    if (!workoutName || workoutName.trim() === "") {
+      console.error("Missing or empty workout name");
+      setError("Please enter a workout name.");
+      return;
+    }
+    
+    if (isSubmitting) {
+      console.warn("Already submitting, please wait...");
+      return;
+    }
     
     try {
+      // Set submitting state to true to prevent multiple clicks
+      setIsSubmitting(true);
       setLoading(true);
       
+      console.log("Starting save process for workout " + currentStep);
+      
+      // Stop the animation frame during save to avoid race conditions
+      if (animationFrameRef.current) {
+        console.log("Stopping animation frame during save");
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
       // Upload image to Firebase Storage
-      if (!firebase.storage) {
+      if (!storage) {
+        console.error("Firebase storage is not initialized");
         throw new Error("Firebase storage module not found");
       }
       
-      const storage = firebase.storage();
+      // Verify Firebase storage is working properly
+      console.log("Verifying Firebase storage", { 
+        hasStorage: !!storage,
+        hasRef: !!storage.ref,
+        storageBucket: storage.app.options.storageBucket 
+      });
+      
+      console.log("Uploading image to Firebase Storage");
       const storageRef = storage.ref();
       const imageRef = storageRef.child(`users/${currentUser.uid}/plans/${planId}/workouts/workout_${currentStep}.png`);
       
@@ -355,8 +728,10 @@ export default function Calibration() {
       // Upload the image
       const uploadTask = await imageRef.put(blob);
       const imageUrl = await uploadTask.ref.getDownloadURL();
+      console.log("Image uploaded successfully, URL:", imageUrl.substring(0, 50) + "...");
       
       // Save workout to Firestore
+      console.log("Saving workout data to Firestore");
       const workoutData = {
         name: workoutName,
         imageUrl: imageUrl,
@@ -368,10 +743,48 @@ export default function Calibration() {
         .collection('plans').doc(planId)
         .collection('workouts');
       
-      await workoutsRef.add(workoutData);
+      const workoutDoc = await workoutsRef.add(workoutData);
+      console.log("Workout saved with ID:", workoutDoc.id);
+      
+      // Get the latest pose landmarks if we have them
+      if (poseLandmarkerRef.current && videoRef.current) {
+        try {
+          // Ensure video is ready before trying to get landmarks
+          if (videoRef.current.readyState >= 2 && 
+              videoRef.current.videoWidth > 0 && 
+              videoRef.current.videoHeight > 0) {
+            
+            console.log("Capturing pose landmarks before moving on");
+            const results = await poseLandmarkerRef.current.detectForVideo(videoRef.current, performance.now());
+            
+            if (results.landmarks && results.landmarks.length > 0) {
+              // Save the pose landmarks to Firestore for later use in pose comparison
+              const landmarksData = {
+                landmarks: results.landmarks[0],
+                position: currentStep,
+                workoutId: workoutDoc.id,
+                timestamp: firebase.firestore.FieldValue.serverTimestamp()
+              };
+              
+              await db.collection('users').doc(currentUser.uid)
+                .collection('plans').doc(planId)
+                .collection('poseLandmarks')
+                .add(landmarksData);
+              
+              console.log("Saved pose landmarks for later comparison");
+            }
+          } else {
+            console.warn("Video not ready for landmark capture during save");
+          }
+        } catch (error) {
+          console.error("Error capturing pose landmarks:", error);
+          // Continue anyway - this is not critical
+        }
+      }
       
       // If this is the first workout, use it as the plan thumbnail
       if (currentStep === 1) {
+        console.log("Setting plan thumbnail image");
         await db.collection('users').doc(currentUser.uid)
           .collection('plans').doc(planId)
           .update({ imageUrl: imageUrl });
@@ -379,32 +792,255 @@ export default function Calibration() {
       
       // Move to next step or finish
       if (currentStep < workoutCount) {
-        setCurrentStep(currentStep + 1);
+        // Prepare for next step
+        const nextStep = currentStep + 1;
+        
+        // First clear the state before moving to next step
         setCapturedImage(null);
         setWorkoutName("");
-        setLoading(false);
         
-        // Restart pose detection for the next step
-        setTimeout(() => {
-          if (isMPReady) {
-            startPoseDetection();
-          }
-        }, 500);
+        console.log(`Moving to step ${nextStep} of ${workoutCount}`);
+        await moveToNextStep(nextStep);
       } else {
+        // All steps complete
+        console.log("All calibration steps complete!");
+        
         // Update plan with completion status
         await db.collection('users').doc(currentUser.uid)
           .collection('plans').doc(planId)
           .update({ isCalibrated: true });
         
+        // Reset the submitting state before redirecting
+        setIsSubmitting(false);
+        
         // Redirect to plan details page
+        console.log("Redirecting to plan details page");
         router.push(`/plans/${planId}`);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Error saving workout:", err);
-      setError("Failed to save workout");
+      setError("Failed to save workout: " + err.message);
       setLoading(false);
+      setIsSubmitting(false);  // Reset submitting state on error
     }
   };
+
+  // Function to explicitly restart the video element
+  const restartVideo = async () => {
+    console.log("Attempting to restart video feed");
+    
+    if (!videoRef.current) {
+      console.error("Video element not available");
+      return false;
+    }
+    
+    try {
+      // First completely stop and clean up the existing stream
+      if (videoRef.current.srcObject) {
+        console.log("Cleaning up existing video stream");
+        const existingStream = videoRef.current.srcObject as MediaStream;
+        existingStream.getTracks().forEach(track => {
+          console.log("Stopping track:", track.kind, track.readyState);
+          track.stop();
+        });
+        
+        // Clear the video source
+        videoRef.current.srcObject = null;
+        
+        // Clear any existing event handlers
+        videoRef.current.onloadedmetadata = null;
+        videoRef.current.onplaying = null;
+        videoRef.current.onerror = null;
+        
+        // Pause to let the browser clean up resources
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+      
+      // Cancel any ongoing animation frames
+      if (animationFrameRef.current) {
+        console.log("Canceling animation frame:", animationFrameRef.current);
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
+      // Request a new camera stream with explicit constraints
+      console.log("Requesting new camera stream");
+      const constraints = {
+        video: {
+          facingMode: "user",
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        }
+      };
+      
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      console.log("New stream obtained with tracks:", stream.getTracks().length);
+      
+      // Double check the video element is still available
+      if (!videoRef.current) {
+        console.error("Video element became unavailable");
+        stream.getTracks().forEach(track => track.stop());
+        return false;
+      }
+      
+      // Assign the new stream to the video element
+      videoRef.current.srcObject = stream;
+      console.log("New stream assigned to video element");
+      
+      // Return a promise that resolves when the video is playing
+      return new Promise<boolean>((resolve) => {
+        if (!videoRef.current) {
+          stream.getTracks().forEach(track => track.stop());
+          resolve(false);
+          return;
+        }
+        
+        // Handle errors
+        videoRef.current.onerror = (e) => {
+          console.error("Video error during restart:", e);
+          resolve(false);
+        };
+        
+        // Use the loadedmetadata event to wait for the video to be ready
+        videoRef.current.onloadedmetadata = () => {
+          console.log("Video metadata loaded during restart");
+          
+          if (!videoRef.current) {
+            stream.getTracks().forEach(track => track.stop());
+            resolve(false);
+            return;
+          }
+          
+          // Set up Canvas as soon as metadata is loaded
+          if (canvasRef.current) {
+            console.log("Setting up canvas after video metadata loaded");
+            canvasRef.current.width = videoRef.current.videoWidth;
+            canvasRef.current.height = videoRef.current.videoHeight;
+            
+            // Draw loading message
+            const ctx = canvasRef.current.getContext('2d');
+            if (ctx) {
+              ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+              ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+              ctx.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+              ctx.fillStyle = 'white';
+              ctx.font = '20px Arial';
+              ctx.textAlign = 'center';
+              ctx.fillText('Starting camera...', canvasRef.current.width/2, canvasRef.current.height/2);
+            }
+          }
+          
+          // Wait a moment before playing to avoid browser artifacts
+          setTimeout(() => {
+            if (!videoRef.current) {
+              stream.getTracks().forEach(track => track.stop());
+              resolve(false);
+              return;
+            }
+            
+            // Now play the video
+            videoRef.current.play()
+              .then(() => {
+                console.log("Video playing successfully after restart");
+                
+                // Set up canvas again with the final dimensions
+                setupCanvas();
+                
+                // Start pose detection
+                startPoseDetection();
+                
+                console.log("Video restart complete - pose detection started");
+                setTimeout(() => resolve(true), 100); // Short delay to ensure rendering has started
+              })
+              .catch((error) => {
+                console.error("Error playing video after restart:", error);
+                resolve(false);
+              });
+          }, 200);
+        };
+        
+        // Set a timeout in case the video never loads
+        setTimeout(() => {
+          console.warn("Video restart timed out after 5 seconds");
+          resolve(false);
+        }, 5000);
+      });
+    } catch (error) {
+      console.error("Error restarting video:", error);
+      return false;
+    }
+  };
+
+  // Make sure we reset everything properly between calibration steps
+  useEffect(() => {
+    // Only run this effect if we're not already in the middle of capturing and don't have a captured image
+    if (!isCapturing && !capturedImage && isMPReady) {
+      console.log("Resetting pose detection for step", currentStep);
+      
+      // Cancel any existing animation frame first
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
+      // Make sure video is playing
+      if (videoRef.current && videoRef.current.paused) {
+        videoRef.current.play().catch(e => {
+          console.error("Error auto-playing video:", e);
+        });
+      }
+      
+      // Check if video is ready, and if not, set up a polling mechanism
+      const checkVideoAndSetup = () => {
+        if (videoRef.current && videoRef.current.readyState >= 2 && 
+            videoRef.current.videoWidth > 0 && videoRef.current.videoHeight > 0) {
+          console.log("Video ready for step", currentStep, "- setting up canvas and detection");
+          setupCanvas();
+          startPoseDetection();
+        } else {
+          console.log("Video not ready yet for step", currentStep, "- will retry");
+          setTimeout(checkVideoAndSetup, 100);
+        }
+      };
+      
+      // Short delay to make sure everything is ready
+      setTimeout(checkVideoAndSetup, 100);
+    }
+  }, [capturedImage, isMPReady, currentStep, isCapturing]);
+
+  // Cleanup on component unmount
+  useEffect(() => {
+    let mounted = true;
+    
+    return () => {
+      mounted = false;
+      console.log("Component unmounting, cleaning up resources");
+      
+      // Cancel any animation frames
+      if (animationFrameRef.current) {
+        console.log("Canceling animation frame on unmount");
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
+      // Stop the camera feed
+      if (videoRef.current && videoRef.current.srcObject) {
+        console.log("Stopping camera feed on unmount");
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => {
+          console.log(`Stopping ${track.kind} track`);
+          track.stop();
+        });
+        videoRef.current.srcObject = null;
+      }
+      
+      // Clear any MediaPipe resources
+      if (poseLandmarkerRef.current) {
+        console.log("Closing MediaPipe resources");
+        poseLandmarkerRef.current.close();
+      }
+    };
+  }, []);
 
   if (loading && !isMPReady) {
     return (
@@ -421,6 +1057,12 @@ export default function Calibration() {
       <Layout>
         <div className="bg-red-50 p-4 rounded-md border border-red-200 text-red-700 mb-6">
           {error}
+          <button 
+            onClick={() => setError(null)} 
+            className="ml-2 text-sm underline"
+          >
+            Dismiss
+          </button>
         </div>
         <button
           onClick={() => router.push("/plans")}
@@ -473,6 +1115,11 @@ export default function Calibration() {
               placeholder="E.g., Downward Dog, Mountain Climbers"
               required
             />
+            {workoutName === "" && capturedImage && (
+              <p className="text-red-500 text-sm mt-1">
+                Please enter a workout name before saving
+              </p>
+            )}
           </div>
 
           <div className="relative">
@@ -499,7 +1146,6 @@ export default function Calibration() {
                       playsInline
                       muted
                       className="absolute top-0 left-0 w-full h-full rounded-md object-cover"
-                      style={{ transform: "scaleX(-1)" }} // Mirror horizontally
                     />
                     
                     <canvas
@@ -544,10 +1190,10 @@ export default function Calibration() {
                       
                       <button
                         onClick={saveWorkout}
-                        disabled={!workoutName}
+                        disabled={!workoutName || workoutName.trim() === "" || isSubmitting}
                         className="flex-1 bg-green-500 text-white px-4 py-2 rounded hover:bg-green-600 disabled:bg-green-300"
                       >
-                        {currentStep < workoutCount ? "Save & Continue" : "Complete Calibration"}
+                        {isSubmitting ? "Saving..." : (currentStep < workoutCount ? "Save & Continue" : "Complete Calibration")}
                       </button>
                     </div>
                   </>
