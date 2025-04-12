@@ -159,13 +159,13 @@ export default function Workouts() {
         
         // Convert to a similarity score (0-1)
         // A difference of 0 means perfect match (1.0)
-        // Increased from PI/4 (45 degrees) to PI/3 (60 degrees) for more forgiveness
-        // This means even larger angle differences can still get partial scores
-        const similarity = Math.max(0, 1 - (angleDifference / (Math.PI / 3)));
+        // Use a more strict comparison by using PI/4 (45 degrees) as the max difference
+        // This makes it harder to get high scores with moderate differences
+        const similarity = Math.max(0, 1 - (angleDifference / (Math.PI / 4)));
         
-        // Lower the exponent from 1.5 to 1.2 to make the curve less steep
-        // This makes it easier to get higher scores with moderate accuracy
-        const adjustedSimilarity = Math.pow(similarity, 1.2);
+        // Apply a curve to make small differences more significant
+        // This makes scoring more challenging as you need to be more precise
+        const adjustedSimilarity = Math.pow(similarity, 1.1);
         
         feedback[joint] = adjustedSimilarity;
         totalSimilarity += adjustedSimilarity;
@@ -181,8 +181,8 @@ export default function Workouts() {
     }
     
     const overallScore = availableAngles > 0 ? totalSimilarity / availableAngles : 0;
-    // Lower the threshold from 0.8 to 0.75 (75% similarity required for a good match)
-    const isGoodMatch = overallScore >= 0.75;
+    // Increase the threshold to 0.8 (80%) for a good match
+    const isGoodMatch = overallScore >= 0.8;
     
     console.log(`Overall Match: ${(overallScore * 100).toFixed(1)}%, Good Match: ${isGoodMatch}`);
     
@@ -223,19 +223,99 @@ export default function Workouts() {
     ];
 
     ctx.strokeStyle = '#00FF00';
-    ctx.lineWidth = 4;
+    ctx.lineWidth = 3; // Changed from 4 to 3 to match calibration page
 
     connections.forEach(([start, end]) => {
       if (landmarks[start] && landmarks[end]) {
+        // Use explicit variable names for clarity like in calibration page
         const startX = ctx.canvas.width - (landmarks[start].x * ctx.canvas.width);
+        const startY = landmarks[start].y * ctx.canvas.height;
         const endX = ctx.canvas.width - (landmarks[end].x * ctx.canvas.width);
+        const endY = landmarks[end].y * ctx.canvas.height;
         
         ctx.beginPath();
-        ctx.moveTo(startX, landmarks[start].y * ctx.canvas.height);
-        ctx.lineTo(endX, landmarks[end].y * ctx.canvas.height);
+        ctx.moveTo(startX, startY);
+        ctx.lineTo(endX, endY);
         ctx.stroke();
       }
     });
+  };
+
+  // Function to continuously display mirrored video without pose detection
+  const startContinuousVideoDisplay = () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    
+    const displayVideoFrame = () => {
+      if (!videoRef.current || !canvasRef.current) return;
+      
+      // Only process if no active session (otherwise the session processFrame handles it)
+      if (!isSessionActive) {
+        const canvasCtx = canvasRef.current.getContext('2d');
+        if (canvasCtx && videoRef.current.readyState >= 2) {
+          // Clear canvas
+          canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+          
+          // Save canvas state for mirroring
+          canvasCtx.save();
+          
+          // Flip horizontally
+          canvasCtx.scale(-1, 1);
+          canvasCtx.translate(-canvasRef.current.width, 0);
+          
+          // Calculate dimensions to maintain aspect ratio
+          const videoWidth = videoRef.current.videoWidth;
+          const videoHeight = videoRef.current.videoHeight;
+          const canvasWidth = canvasRef.current.width;
+          const canvasHeight = canvasRef.current.height;
+          
+          let drawWidth = canvasWidth;
+          let drawHeight = canvasHeight;
+          let offsetX = 0;
+          let offsetY = 0;
+          
+          // Calculate dimensions to fill canvas while maintaining aspect ratio
+          const videoRatio = videoWidth / videoHeight;
+          const canvasRatio = canvasWidth / canvasHeight;
+          
+          if (videoRatio > canvasRatio) {
+            // Video is wider than canvas (relative to height)
+            drawHeight = canvasHeight;
+            drawWidth = drawHeight * videoRatio;
+            offsetX = -(drawWidth - canvasWidth) / 2;
+          } else {
+            // Video is taller than canvas (relative to width)
+            drawWidth = canvasWidth;
+            drawHeight = drawWidth / videoRatio;
+            offsetY = -(drawHeight - canvasHeight) / 2;
+          }
+          
+          // Draw the video frame to fill the canvas
+          canvasCtx.drawImage(
+            videoRef.current,
+            offsetX, offsetY,
+            drawWidth, drawHeight
+          );
+          
+          // Restore canvas state
+          canvasCtx.restore();
+          
+          // Add a subtle indicator that the canvas is active but not in session
+          canvasCtx.fillStyle = 'rgba(0, 0, 255, 0.1)';
+          canvasCtx.fillRect(10, 10, 220, 40);
+          canvasCtx.fillStyle = 'white';
+          canvasCtx.font = '20px Arial';
+          canvasCtx.fillText('Waiting to Start Session', 20, 35);
+        }
+      }
+      
+      // Continue the display loop if not in active session
+      if (!isSessionActive) {
+        animationFrameRef.current = requestAnimationFrame(displayVideoFrame);
+      }
+    };
+    
+    // Start the display loop
+    displayVideoFrame();
   };
 
   useEffect(() => {
@@ -289,6 +369,9 @@ export default function Workouts() {
             console.log("Drew test rectangle during initialization");
           }
         }
+
+        // Start a basic mirrored video display even without an active session
+        startContinuousVideoDisplay();
       } catch (error) {
         console.error("Error initializing PoseLandmarker:", error);
         setFeedback("Failed to initialize pose detection. Please refresh the page.");
@@ -297,15 +380,53 @@ export default function Workouts() {
     };
 
     const updateCanvasSize = () => {
-      if (containerRef.current && canvasRef.current && videoRef.current) {
-        const containerWidth = containerRef.current.clientWidth;
-        const containerHeight = containerRef.current.clientHeight;
-        
-        // Set canvas dimensions to match container
-        canvasRef.current.width = containerWidth;
-        canvasRef.current.height = containerHeight;
-        
-        console.log(`Canvas resized to ${containerWidth}x${containerHeight}`);
+      if (!containerRef.current || !canvasRef.current || !videoRef.current) {
+        console.error("Elements missing for canvas setup");
+        return;
+      }
+      
+      // Get container dimensions
+      const containerWidth = containerRef.current.clientWidth;
+      const containerHeight = containerRef.current.clientHeight;
+      
+      // Maintain 16:10 aspect ratio instead of 16:9
+      const aspectRatio = 16/10;
+      
+      // Calculate dimensions that maintain aspect ratio within container
+      let newWidth = containerWidth;
+      let newHeight = containerWidth / aspectRatio;
+      
+      // If calculated height exceeds container height, adjust based on height
+      if (newHeight > containerHeight) {
+        newHeight = containerHeight;
+        newWidth = containerHeight * aspectRatio;
+      }
+      
+      // Set canvas to these dimensions
+      canvasRef.current.width = newWidth;
+      canvasRef.current.height = newHeight;
+      
+      // Center the canvas in container if needed
+      if (newWidth < containerWidth || newHeight < containerHeight) {
+        const marginLeft = (containerWidth - newWidth) / 2;
+        const marginTop = (containerHeight - newHeight) / 2;
+        canvasRef.current.style.marginLeft = `${marginLeft}px`;
+        canvasRef.current.style.marginTop = `${marginTop}px`;
+      } else {
+        canvasRef.current.style.marginLeft = '0';
+        canvasRef.current.style.marginTop = '0';
+      }
+      
+      console.log(`Canvas resized to ${canvasRef.current.width}x${canvasRef.current.height} with aspect ratio ${aspectRatio}`);
+      
+      // Draw a test rectangle to verify canvas is working
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+        ctx.fillRect(20, 20, 60, 60);
+        ctx.fillStyle = 'white';
+        ctx.font = '14px Arial';
+        ctx.fillText('Canvas Ready', 25, 50);
       }
     };
 
@@ -315,9 +436,10 @@ export default function Workouts() {
         
         const constraints = { 
           video: { 
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            facingMode: "user"
+            width: { ideal: 1600 },
+            height: { ideal: 1000 },
+            facingMode: "user",
+            aspectRatio: 16/10 // Force 16:10 aspect ratio
           } 
         };
         
@@ -429,8 +551,6 @@ export default function Workouts() {
       return;
     }
     
-    console.log("Processing frame with session active:", isSessionActive);
-    
     if (!poseLandmarkerRef.current || !videoRef.current || !canvasRef.current || planWorkouts.length === 0) {
       console.log("Missing required references:", {
         poseLandmarker: !!poseLandmarkerRef.current,
@@ -460,16 +580,56 @@ export default function Workouts() {
       // Clear canvas first
       canvasCtx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
       
-      // Draw frame count for debugging
-      const frameCount = animationFrameRef.current || 0;
-      canvasCtx.font = '20px Arial';
-      canvasCtx.fillStyle = 'lime';
-      canvasCtx.fillText(`Frame: ${frameCount}`, 20, 30);
+      // Save the canvas state - like in calibration page
+      canvasCtx.save();
       
-      // Always draw a test rectangle to verify canvas is working
-      canvasCtx.strokeStyle = 'cyan';
-      canvasCtx.lineWidth = 4;
-      canvasCtx.strokeRect(20, 50, 100, 100);
+      // Flip the canvas horizontally for correct mirroring
+      canvasCtx.scale(-1, 1);
+      canvasCtx.translate(-canvasRef.current.width, 0);
+      
+      // Calculate dimensions to maintain aspect ratio
+      const videoWidth = videoRef.current.videoWidth;
+      const videoHeight = videoRef.current.videoHeight;
+      const canvasWidth = canvasRef.current.width;
+      const canvasHeight = canvasRef.current.height;
+      
+      let drawWidth = canvasWidth;
+      let drawHeight = canvasHeight;
+      let offsetX = 0;
+      let offsetY = 0;
+      
+      // Calculate dimensions to fill canvas while maintaining aspect ratio
+      const videoRatio = videoWidth / videoHeight;
+      const canvasRatio = canvasWidth / canvasHeight;
+      
+      if (videoRatio > canvasRatio) {
+        // Video is wider than canvas (relative to height)
+        drawHeight = canvasHeight;
+        drawWidth = drawHeight * videoRatio;
+        offsetX = -(drawWidth - canvasWidth) / 2;
+      } else {
+        // Video is taller than canvas (relative to width)
+        drawWidth = canvasWidth;
+        drawHeight = drawWidth / videoRatio;
+        offsetY = -(drawHeight - canvasHeight) / 2;
+      }
+      
+      // Draw the video frame onto the canvas - like in calibration page
+      canvasCtx.drawImage(
+        videoRef.current, 
+        offsetX, offsetY, 
+        drawWidth, drawHeight
+      );
+      
+      // Restore the canvas state for drawing landmarks without flipping them again
+      canvasCtx.restore();
+      
+      // Add a subtle indicator that the canvas is active
+      canvasCtx.fillStyle = 'rgba(255, 0, 0, 0.1)';
+      canvasCtx.fillRect(10, 10, 200, 40);
+      canvasCtx.fillStyle = 'white';
+      canvasCtx.font = '20px Arial';
+      canvasCtx.fillText('Canvas Active', 20, 35);
       
       // Get current timestamp
       const startTimeMs = performance.now();
@@ -479,9 +639,6 @@ export default function Workouts() {
       
       // Display detection status
       if (results.landmarks && results.landmarks.length > 0) {
-        canvasCtx.fillStyle = 'lime';
-        canvasCtx.fillText(`Detected ${results.landmarks[0].length} landmarks`, 20, 70);
-        
         // Draw detections
         const landmarks = results.landmarks[0];
         
@@ -514,30 +671,30 @@ export default function Workouts() {
               // To simulate a real reference pose with different angles
               const offsetFactors: {[key: number]: number} = {
                 // Key joints with their offset factors (higher = more difficult to match)
-                // Use landmark indices as keys
-                11: 0.08, // left shoulder - increased offset
-                12: 0.08, // right shoulder - increased offset
-                13: 0.15,  // left elbow - increased offset
-                14: 0.15,  // right elbow - increased offset
-                15: 0.2, // left wrist - increased offset
-                16: 0.2, // right wrist - increased offset
-                23: 0.08, // left hip - increased offset
-                24: 0.08, // right hip - increased offset
-                25: 0.15,  // left knee - increased offset
-                26: 0.15,  // right knee - increased offset
-                27: 0.2, // left ankle - increased offset
-                28: 0.2  // right ankle - increased offset
+                // Use landmark indices as keys - using zero offsets to ensure matching requires precision
+                11: 0, // left shoulder - no offset
+                12: 0, // right shoulder - no offset
+                13: 0, // left elbow - no offset
+                14: 0, // right elbow - no offset
+                15: 0, // left wrist - no offset
+                16: 0, // right wrist - no offset
+                23: 0, // left hip - no offset
+                24: 0, // right hip - no offset
+                25: 0, // left knee - no offset
+                26: 0, // right knee - no offset
+                27: 0, // left ankle - no offset
+                28: 0  // right ankle - no offset
               };
               
-              // Get offset factor for this landmark or use small default
-              const offsetFactor = offsetFactors[i] || 0.02;
+              // Get offset factor for this landmark or use zero default
+              const offsetFactor = offsetFactors[i] || 0;
               
-              // Only offset specific landmarks and add slight randomness
-              // This allows the user to actually match the pose by moving
+              // Return exact landmarks (no offsets) to make matching more challenging
+              // This will force users to match their exact current pose
               return {
-                x: l.x + (Math.sin(performance.now() / 10000 + i) * offsetFactor),
-                y: l.y + (Math.cos(performance.now() / 10000 + i) * offsetFactor),
-                z: l.z + (Math.sin(performance.now() / 15000 + i) * offsetFactor)
+                x: l.x,
+                y: l.y,
+                z: l.z
               };
             });
           }
@@ -781,12 +938,15 @@ export default function Workouts() {
       setPoseAccuracies([]);
       
       setFeedback(`Starting "${currentWorkout.name}" workout. Match the pose shown in the reference.`);
-      setIsSessionActive(true);
       
-      // Start the pose detection loop
+      // First cancel any existing animation frame from the continuous display
       if (animationFrameRef.current) {
         cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
       }
+      
+      // Then set session active and start pose detection
+      setIsSessionActive(true);
       processFrame();
       
     } catch (error) {
@@ -860,19 +1020,45 @@ export default function Workouts() {
         setFeedback("Session ended but failed to save progress.");
       }
     }
+    
+    // Restart the continuous video display after ending session
+    setTimeout(() => {
+      if (!isSessionActive) {
+        console.log("Restarting continuous video display after session end");
+        startContinuousVideoDisplay();
+      }
+    }, 100);
   };
 
-  // Log when workout session state changes
+  // Monitor session state changes to properly handle video display
   useEffect(() => {
     console.log("Session active state changed:", isSessionActive);
     
     if (isSessionActive) {
       console.log("Session started with plan:", selectedPlan?.name);
       console.log("Starting with workout:", currentWorkoutIndex + 1, "of", planWorkouts.length);
+      
+      // Session is active, processFrame will handle video rendering
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
+      // Ensure processFrame is running for active session
+      processFrame();
     } else {
-      console.log("Session ended");
+      console.log("Session ended or inactive");
+      
+      // Cancel any existing animation frame from the session
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+      
+      // Start continuous display mode
+      startContinuousVideoDisplay();
     }
-  }, [isSessionActive, selectedPlan, currentWorkoutIndex, planWorkouts.length]);
+  }, [isSessionActive]);
 
   const calibratePose = async () => {
     if (isLoading) {
@@ -1030,53 +1216,26 @@ export default function Workouts() {
       <div className="flex flex-col items-center">
         <h1 className="text-2xl font-bold mb-6">Workouts - Pose Guidance</h1>
         
-        <div className="flex w-full">
-          <div className="flex flex-col items-center w-full">
-            {/* Hidden element to track session state */}
-            <div id="session-active-check" data-active={isSessionActive ? 'true' : 'false'} style={{ display: 'none' }}></div>
-            
+        {/* Hidden element to track session state */}
+        <div id="session-active-check" data-active={isSessionActive ? 'true' : 'false'} style={{ display: 'none' }}></div>
+        
+        <div className="flex w-full gap-4">
+          {/* Left Column - Camera Feed */}
+          <div className="flex flex-col items-center w-[80%]">
             {/* Webcam Feed Area */}
-            <div ref={containerRef} className="relative w-full h-[70vh] bg-black mb-4">
+            <div ref={containerRef} className="relative w-full h-[75vh] bg-black mb-4 flex items-center justify-center overflow-hidden">
               <video 
                 ref={videoRef} 
                 autoPlay 
                 playsInline 
                 muted 
-                className="absolute w-full h-full object-cover z-10 transform scale-x-[-1]"
+                className="absolute w-full h-full object-contain invisible"
               />
               <canvas 
                 ref={canvasRef} 
-                className="absolute w-full h-full z-20"
-                style={{ backgroundColor: 'rgba(0,0,0,0.1)' }}
+                className="z-20 w-full h-full"
+                style={{ display: 'block' }}
               />
-              
-              {/* Selected Plan Display - Bottom Left */}
-              {selectedPlan && planWorkouts.length > 0 && (
-                <div className="absolute bottom-4 right-4 z-30 bg-white p-2 rounded-lg shadow-md w-44">
-                  <div className="flex flex-col">
-                    <div className="text-sm font-semibold mb-1 truncate">{selectedPlan.name}</div>
-                    <div className="h-32 bg-gray-200 rounded-md overflow-hidden mb-1">
-                      {planWorkouts[currentWorkoutIndex]?.imageUrl ? (
-                        <img 
-                          src={planWorkouts[currentWorkoutIndex].imageUrl} 
-                          alt={planWorkouts[currentWorkoutIndex].name} 
-                          className="w-full h-full object-cover"
-                        />
-                      ) : (
-                        <div className="flex items-center justify-center h-full text-xs text-gray-500">
-                          No Image
-                        </div>
-                      )}
-                    </div>
-                    <div className="text-xs text-gray-700 mb-1 truncate">
-                      {planWorkouts[currentWorkoutIndex]?.name || "Workout"}
-                    </div>
-                    <div className="text-xs text-gray-500">
-                      Workout {currentWorkoutIndex + 1} of {planWorkouts.length}
-                    </div>
-                  </div>
-                </div>
-              )}
               
               {/* Example pose image - Bottom Right (only in active session) */}
               {isSessionActive && planWorkouts.length > 0 && currentWorkoutIndex < planWorkouts.length && (
@@ -1119,7 +1278,7 @@ export default function Workouts() {
             </div>
             
             {/* Control Buttons */}
-            <div className="flex space-x-4 mb-4">
+            <div className="flex space-x-4 mb-4 w-full justify-center">
               <button 
                 onClick={startSession}
                 disabled={isSessionActive || !selectedPlan}
@@ -1148,14 +1307,50 @@ export default function Workouts() {
                 Choose Your Plan
               </button>
             </div>
+          </div>
+          
+          {/* Right Column - Feedback and Information */}
+          <div className="w-[30%] flex flex-col">
+            {/* Current Workout Info */}
+            {selectedPlan && (
+              <div className="bg-white p-4 rounded-lg shadow-md mb-4">
+                <h2 className="text-xl font-bold mb-3">Current Plan</h2>
+                <div className="flex items-start">
+                  <div className="w-24 h-24 bg-gray-200 rounded-md overflow-hidden mr-4 flex-shrink-0">
+                    {selectedPlan.imageUrl ? (
+                      <img src={selectedPlan.imageUrl} alt={selectedPlan.name} className="w-full h-full object-cover" />
+                    ) : (
+                      <div className="flex items-center justify-center h-full text-xs text-gray-500">No image</div>
+                    )}
+                  </div>
+                  <div className="flex-1">
+                    <p className="font-semibold text-lg">{selectedPlan.name}</p>
+                    <p className="text-sm text-gray-600 mb-2">
+                      {currentWorkoutIndex + 1} of {planWorkouts.length} workouts
+                    </p>
+                    
+                    {planWorkouts.length > 0 && currentWorkoutIndex < planWorkouts.length && (
+                      <div className="mt-2 pt-2 border-t border-gray-200">
+                        <div className="font-medium">Current Workout:</div>
+                        <div className="text-blue-600 font-medium">{planWorkouts[currentWorkoutIndex]?.name}</div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
             
             {/* Feedback Panel */}
-            <div className="bg-white p-4 rounded-lg shadow-md w-full">
+            <div className="bg-white p-4 rounded-lg shadow-md mb-4 flex-grow">
               <p className="text-lg font-semibold mb-2">Status:</p>
               <p className="whitespace-pre-line">{feedback}</p>
               {isSessionActive && overallSimilarity > 0 && (
-                <div className="mt-2">
-                  <div className="w-full bg-gray-200 rounded-full h-4">
+                <div className="mt-4">
+                  <div className="flex justify-between mb-1 text-sm">
+                    <span>Pose Accuracy</span>
+                    <span>{Math.round(overallSimilarity * 100)}%</span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-4 mb-4">
                     <div 
                       className={`h-4 rounded-full ${
                         overallSimilarity > 0.8 ? 'bg-green-500' : 
@@ -1163,6 +1358,28 @@ export default function Workouts() {
                       }`}
                       style={{ width: `${Math.round(overallSimilarity * 100)}%` }}
                     ></div>
+                  </div>
+                  
+                  {/* Individual Joint Feedbacks */}
+                  <h3 className="text-md font-medium mb-2 mt-4">Joint Accuracy</h3>
+                  <div className="space-y-2">
+                    {Object.entries(poseMatchFeedback).map(([joint, score]) => (
+                      <div key={joint}>
+                        <div className="flex justify-between text-xs mb-1">
+                          <span>{joint.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase())}</span>
+                          <span>{Math.round(score * 100)}%</span>
+                        </div>
+                        <div className="w-full bg-gray-200 rounded-full h-2">
+                          <div 
+                            className={`h-2 rounded-full ${
+                              score > 0.8 ? 'bg-green-500' : 
+                              score > 0.6 ? 'bg-yellow-500' : 'bg-red-500'
+                            }`}
+                            style={{ width: `${Math.round(score * 100)}%` }}
+                          ></div>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}
