@@ -1,0 +1,26 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /users/{userId} {
+      allow read, write, delete: if request.auth != null && request.auth.uid == userId;
+      
+      match /plans/{planId} {
+        allow read, write, delete: if request.auth != null && request.auth.uid == userId;
+        
+        match /workouts/{workoutId} {
+          allow read, write, delete: if request.auth != null && request.auth.uid == userId;
+        }
+        
+        match /poseLandmarks/{landmarkId} {
+          allow read, write, delete: if request.auth != null && request.auth.uid == userId;
+        }
+      }
+    }
+    
+    // Add rules for root-level poseLandmarks collection
+    match /poseLandmarks/{landmarkId} {
+      allow read: if request.auth != null && resource.data.userId == request.auth.uid;
+      allow write, delete: if request.auth != null && request.resource.data.userId == request.auth.uid;
+    }
+  }
+} 

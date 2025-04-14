@@ -121,6 +121,23 @@ export default function PlanDetails() {
         batch.delete(doc.ref);
       });
       
+      // Also delete from root-level collection
+      try {
+        const rootLandmarksSnapshot = await db.collection('poseLandmarks')
+          .where('planId', '==', planId)
+          .where('userId', '==', currentUser.uid)
+          .get();
+        
+        rootLandmarksSnapshot.docs.forEach(doc => {
+          batch.delete(doc.ref);
+        });
+        
+        console.log(`Deleted ${rootLandmarksSnapshot.docs.length} landmarks from root collection`);
+      } catch (err) {
+        console.error("Error deleting from root landmarks collection:", err);
+        // Continue with deletion anyway
+      }
+      
       await batch.commit();
       
       // Finally, delete the plan document itself
@@ -158,6 +175,25 @@ export default function PlanDetails() {
       
       // Delete in a batch
       const batch = db.batch();
+      
+      // Also check root-level collection
+      try {
+        const rootLandmarksSnapshot = await db.collection('poseLandmarks')
+          .where('workoutId', '==', workoutId)
+          .where('planId', '==', planId)
+          .where('userId', '==', currentUser.uid)
+          .get();
+          
+        rootLandmarksSnapshot.docs.forEach(doc => {
+          batch.delete(doc.ref);
+        });
+        
+        console.log(`Deleted ${rootLandmarksSnapshot.docs.length} landmarks from root collection for workout`);
+      } catch (err) {
+        console.error("Error deleting workout landmarks from root collection:", err);
+        // Continue with deletion anyway
+      }
+      
       landmarksSnapshot.docs.forEach(doc => {
         batch.delete(doc.ref);
       });

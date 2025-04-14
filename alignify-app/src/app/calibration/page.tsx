@@ -8,6 +8,22 @@ import firebase from 'firebase/compat/app';
 import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
 import { db, storage } from '@/lib/firebase';
 
+// Define a proper interface for landmarks at the top of the file
+interface PoseLandmark {
+  x: number;
+  y: number;
+  z: number;
+  visibility?: number;
+}
+
+interface StoredPoseLandmark {
+  index: number;
+  x: number;
+  y: number;
+  z: number;
+  visibility: number;
+}
+
 export default function CalibrationPage() {
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -27,10 +43,13 @@ export default function CalibrationPage() {
   const [isMPReady, setIsMPReady] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const poseLandmarkerRef = useRef<any>(null);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
+  const imagePoseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const smoothedLandmarks = useRef<Array<any[]>>([]);
+  const smoothingWindowSize = 5;
   
   // Load plan details on mount
   useEffect(() => {
@@ -101,7 +120,13 @@ export default function CalibrationPage() {
         
         if (!mounted) return;
         
-        // Initialize PoseLandmarker
+        // Initialize PoseLandmarker for video
+        console.log("Initializing PoseLandmarker for video with options:", {
+          modelPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+          delegate: "GPU",
+          runningMode: "VIDEO"
+        });
+        
         poseLandmarkerRef.current = await PoseLandmarker.createFromOptions(
           vision,
           {
@@ -117,6 +142,29 @@ export default function CalibrationPage() {
             outputSegmentationMasks: false
           }
         );
+        
+        // Also initialize a separate PoseLandmarker for static images
+        console.log("Initializing separate PoseLandmarker for static images");
+        try {
+          imagePoseLandmarkerRef.current = await PoseLandmarker.createFromOptions(
+            vision,
+            {
+              baseOptions: {
+                modelAssetPath: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+                delegate: "GPU"
+              },
+              runningMode: "IMAGE",
+              numPoses: 1,
+              minPoseDetectionConfidence: 0.5,
+              minPosePresenceConfidence: 0.5,
+              minTrackingConfidence: 0.5,
+              outputSegmentationMasks: false
+            }
+          );
+          console.log("Image PoseLandmarker initialized successfully");
+        } catch (imageInitErr) {
+          console.error("Failed to initialize image PoseLandmarker:", imageInitErr);
+        }
         
         if (!mounted) return;
         setIsMPReady(true);
@@ -234,6 +282,17 @@ export default function CalibrationPage() {
         videoRef.current.onloadedmetadata = null;
         videoRef.current.onplaying = null;
         videoRef.current.onerror = null;
+      }
+      
+      // Clear any MediaPipe resources
+      if (poseLandmarkerRef.current) {
+        console.log("Closing MediaPipe video landmarker resources");
+        poseLandmarkerRef.current.close();
+      }
+      
+      if (imagePoseLandmarkerRef.current) {
+        console.log("Closing MediaPipe image landmarker resources");
+        imagePoseLandmarkerRef.current.close();
       }
     };
   }, []);
@@ -402,7 +461,42 @@ export default function CalibrationPage() {
         
         // Draw pose landmarks if available
         if (results.landmarks && results.landmarks.length > 0) {
-          const landmarks = results.landmarks[0];
+          const currentLandmarks = results.landmarks[0];
+          
+          // Initialize smoothed landmarks if needed
+          if (smoothedLandmarks.current.length === 0) {
+            // First frame, just use current landmarks
+            smoothedLandmarks.current = Array(smoothingWindowSize).fill([...currentLandmarks]);
+          } else {
+            // Add current landmarks to the buffer
+            smoothedLandmarks.current.push([...currentLandmarks]);
+            // Remove oldest entry if buffer is full
+            if (smoothedLandmarks.current.length > smoothingWindowSize) {
+              smoothedLandmarks.current.shift();
+            }
+          }
+          
+          // Create smoothed version by averaging across frames
+          const smoothed = currentLandmarks.map((_, i) => {
+            // For each landmark position
+            const avgX = smoothedLandmarks.current.reduce((sum, frame) => 
+              sum + (frame[i]?.x || 0), 0) / smoothedLandmarks.current.length;
+            const avgY = smoothedLandmarks.current.reduce((sum, frame) => 
+              sum + (frame[i]?.y || 0), 0) / smoothedLandmarks.current.length;
+            const avgZ = smoothedLandmarks.current.reduce((sum, frame) => 
+              sum + (frame[i]?.z || 0), 0) / smoothedLandmarks.current.length;
+            
+            return {
+              ...currentLandmarks[i],
+              x: avgX,
+              y: avgY,
+              z: avgZ
+            };
+          });
+          
+          // Use smoothed landmarks for drawing
+          const landmarks = smoothed;
+          
           drawConnections(canvasCtx, landmarks);
           drawLandmarks(canvasCtx, landmarks);
         }
@@ -746,40 +840,120 @@ export default function CalibrationPage() {
       const workoutDoc = await workoutsRef.add(workoutData);
       console.log("Workout saved with ID:", workoutDoc.id);
       
-      // Get the latest pose landmarks if we have them
-      if (poseLandmarkerRef.current && videoRef.current) {
-        try {
-          // Ensure video is ready before trying to get landmarks
-          if (videoRef.current.readyState >= 2 && 
-              videoRef.current.videoWidth > 0 && 
-              videoRef.current.videoHeight > 0) {
-            
-            console.log("Capturing pose landmarks before moving on");
-            const results = await poseLandmarkerRef.current.detectForVideo(videoRef.current, performance.now());
-            
-            if (results.landmarks && results.landmarks.length > 0) {
-              // Save the pose landmarks to Firestore for later use in pose comparison
-              const landmarksData = {
-                landmarks: results.landmarks[0],
-                position: currentStep,
-                workoutId: workoutDoc.id,
-                timestamp: firebase.firestore.FieldValue.serverTimestamp()
-              };
+      // EXTRACT LANDMARKS DIRECTLY HERE INSTEAD OF IN SEPARATE FUNCTION
+      console.log("Starting landmark extraction process");
+      
+      try {
+        // Create a new Image from capturedImage
+        const img = new Image();
+        
+        // Define what happens when image loads
+        await new Promise<void>((resolve, reject) => {
+          img.onload = () => {
+            console.log("Reference image loaded successfully:", {
+              width: img.width, 
+              height: img.height
+            });
+            resolve();
+          };
+          
+          img.onerror = (err) => {
+            console.error("Image failed to load:", err);
+            reject(err);
+          };
+          
+          // Set source to trigger loading
+          img.src = capturedImage;
+          
+          // Add timeout in case image never loads
+          setTimeout(() => {
+            console.log("Image load timeout triggered");
+            resolve();
+          }, 2000);
+        });
+        
+        // Create a temporary canvas
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = img.width || 640;  // Fallback size if image dimensions are zero
+        tempCanvas.height = img.height || 480;
+        
+        console.log("Created temp canvas with dimensions:", {
+          width: tempCanvas.width,
+          height: tempCanvas.height
+        });
+        
+        const tempCtx = tempCanvas.getContext('2d');
+        
+        if (tempCtx) {
+          // Draw the image to canvas
+          tempCtx.drawImage(img, 0, 0);
+          console.log("Drew image to temporary canvas");
+          
+          // Try to detect landmarks using IMAGE mode landmarker
+          if (imagePoseLandmarkerRef.current) {
+            try {
+              console.log("Using IMAGE mode landmarker for detection");
+              const results = await imagePoseLandmarkerRef.current.detect(tempCanvas);
               
-              await db.collection('users').doc(currentUser.uid)
-                .collection('plans').doc(planId)
-                .collection('poseLandmarks')
-                .add(landmarksData);
+              console.log("Detection results:", {
+                hasResults: !!results,
+                hasLandmarks: results?.landmarks ? true : false,
+                landmarkCount: results?.landmarks?.[0]?.length || 0
+              });
               
-              console.log("Saved pose landmarks for later comparison");
+              if (results && results.landmarks && results.landmarks.length > 0) {
+                // Format landmarks for storage using the defined interface
+                const formattedLandmarks = results.landmarks[0].map((landmark, index: number): StoredPoseLandmark => {
+                  // Use type assertion to ensure landmark is treated as PoseLandmark
+                  const poseLandmark = landmark as PoseLandmark;
+                  return {
+                    index,
+                    x: parseFloat(poseLandmark.x.toFixed(5)),
+                    y: parseFloat(poseLandmark.y.toFixed(5)),
+                    z: parseFloat(poseLandmark.z.toFixed(5)),
+                    visibility: parseFloat((poseLandmark.visibility || 1).toFixed(5))
+                  };
+                });
+                
+                console.log(`Formatted ${formattedLandmarks.length} landmarks for storage`);
+                
+                // Store landmarks in Firestore
+                const landmarksData = {
+                  landmarks: formattedLandmarks,
+                  position: currentStep,
+                  workoutId: workoutDoc.id,
+                  workoutName: workoutName,
+                  planId: planId,
+                  userId: currentUser.uid,
+                  source: "image",
+                  createdAt: firebase.firestore.FieldValue.serverTimestamp()
+                };
+                
+                // Save to root collection
+                const landmarkDocRef = await db.collection('poseLandmarks').add(landmarksData);
+                
+                console.log("Saved landmarks to Firestore with ID:", landmarkDocRef.id);
+                
+                // Update workout with landmark reference
+                await workoutDoc.update({
+                  landmarksId: landmarkDocRef.id,
+                  landmarksCount: formattedLandmarks.length
+                });
+                
+                console.log("Updated workout with landmark reference");
+              } else {
+                console.warn("No landmarks detected in the image");
+              }
+            } catch (error) {
+              console.error("Error during landmark detection:", error);
             }
           } else {
-            console.warn("Video not ready for landmark capture during save");
+            console.warn("Image pose landmarker not initialized");
           }
-        } catch (error) {
-          console.error("Error capturing pose landmarks:", error);
-          // Continue anyway - this is not critical
         }
+      } catch (landmarkError) {
+        console.error("Error in landmark extraction process:", landmarkError);
+        // Continue with the save process even if landmark extraction fails
       }
       
       // If this is the first workout, use it as the plan thumbnail
@@ -1036,8 +1210,13 @@ export default function CalibrationPage() {
       
       // Clear any MediaPipe resources
       if (poseLandmarkerRef.current) {
-        console.log("Closing MediaPipe resources");
+        console.log("Closing MediaPipe video landmarker resources");
         poseLandmarkerRef.current.close();
+      }
+      
+      if (imagePoseLandmarkerRef.current) {
+        console.log("Closing MediaPipe image landmarker resources");
+        imagePoseLandmarkerRef.current.close();
       }
     };
   }, []);

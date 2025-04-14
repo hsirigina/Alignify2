@@ -11,6 +11,23 @@ import { useRouter } from "next/navigation";
 import firebase from "firebase/compat/app";
 import "firebase/compat/firestore";
 
+// Define interfaces for landmarks
+interface PoseLandmark {
+  x: number;
+  y: number;
+  z: number;
+  visibility?: number;
+  index?: number;
+}
+
+interface StoredPoseLandmark {
+  index: number;
+  x: number;
+  y: number;
+  z: number;
+  visibility: number;
+}
+
 // Add a proper interface for Plan and Workout
 interface Workout {
   id: string;
@@ -30,8 +47,14 @@ interface Plan {
 
 // Interface for stored landmarks
 interface StoredPoseLandmarks {
-  landmarks: any[];
+  landmarks: StoredPoseLandmark[];
+  position: number;
+  workoutId: string;
+  workoutName?: string;
   timestamp: any;
+  source?: string;
+  userId?: string;
+  planId?: string;
 }
 
 export default function Workouts() {
@@ -40,6 +63,8 @@ export default function Workouts() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const animationFrameRef = useRef<number | null>(null);
+  const smoothedLandmarks = useRef<Array<any[]>>([]);
+  const smoothingWindowSize = 5; // Number of frames to average
   
   const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
   const [calibratedPose, setCalibratedPose] = useState<any>(null);
@@ -57,7 +82,8 @@ export default function Workouts() {
   const [holdTimer, setHoldTimer] = useState<number | null>(null);
   const [isInCorrectPose, setIsInCorrectPose] = useState<boolean>(false);
   const [showCompletionFeedback, setShowCompletionFeedback] = useState<boolean>(false);
-  const [poseHoldDuration, setPoseHoldDuration] = useState<number>(5); // 5 seconds for testing
+  const [poseHoldDuration, setPoseHoldDuration] = useState<number>(3); // Reduced to 3 seconds for testing
+  const [showReferenceOverlay, setShowReferenceOverlay] = useState(true); // Default to showing the overlay
   const { currentUser } = useAuth();
   const router = useRouter();
 
@@ -181,7 +207,6 @@ export default function Workouts() {
     }
     
     const overallScore = availableAngles > 0 ? totalSimilarity / availableAngles : 0;
-    // Increase the threshold to 0.8 (80%) for a good match
     const isGoodMatch = overallScore >= 0.8;
     
     console.log(`Overall Match: ${(overallScore * 100).toFixed(1)}%, Good Match: ${isGoodMatch}`);
@@ -194,12 +219,12 @@ export default function Workouts() {
   };
 
   // Draw pose landmarks manually using canvas API
-  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: any) => {
+  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: any[], color: string = '#FF0000') => {
     landmarks.forEach((landmark: any) => {
       ctx.beginPath();
       const mirroredX = ctx.canvas.width - (landmark.x * ctx.canvas.width);
       ctx.arc(mirroredX, landmark.y * ctx.canvas.height, 8, 0, 2 * Math.PI);
-      ctx.fillStyle = '#FF0000';
+      ctx.fillStyle = color;
       ctx.fill();
       ctx.strokeStyle = '#FFFFFF';
       ctx.lineWidth = 2;
@@ -208,7 +233,7 @@ export default function Workouts() {
   };
 
   // Draw connections between landmarks
-  const drawConnections = (ctx: CanvasRenderingContext2D, landmarks: any) => {
+  const drawConnections = (ctx: CanvasRenderingContext2D, landmarks: any[], color: string = '#00FF00') => {
     const connections = [
       // Torso
       [11, 12], [12, 24], [24, 23], [23, 11],
@@ -222,12 +247,11 @@ export default function Workouts() {
       [24, 26], [26, 28], [28, 30], [28, 32]
     ];
 
-    ctx.strokeStyle = '#00FF00';
-    ctx.lineWidth = 3; // Changed from 4 to 3 to match calibration page
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
 
     connections.forEach(([start, end]) => {
       if (landmarks[start] && landmarks[end]) {
-        // Use explicit variable names for clarity like in calibration page
         const startX = ctx.canvas.width - (landmarks[start].x * ctx.canvas.width);
         const startY = landmarks[start].y * ctx.canvas.height;
         const endX = ctx.canvas.width - (landmarks[end].x * ctx.canvas.width);
@@ -239,6 +263,29 @@ export default function Workouts() {
         ctx.stroke();
       }
     });
+  };
+  
+  // Draw the reference pose as an overlay
+  const drawReferencePose = (ctx: CanvasRenderingContext2D) => {
+    // Check if we have a reference pose for the current workout
+    if (referencePoseLandmarks.length > currentWorkoutIndex && 
+        referencePoseLandmarks[currentWorkoutIndex]?.landmarks) {
+      
+      const referencePose = referencePoseLandmarks[currentWorkoutIndex].landmarks;
+      
+      // Draw reference pose with transparency
+      ctx.globalAlpha = 0.3; // Set transparency
+      drawConnections(ctx, referencePose, '#0000FF'); // Blue for reference
+      drawLandmarks(ctx, referencePose, '#0000FF');
+      ctx.globalAlpha = 1.0; // Reset transparency
+      
+      // Add a small label
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+      ctx.fillRect(10, 60, 140, 30);
+      ctx.fillStyle = 'white';
+      ctx.font = '14px Arial';
+      ctx.fillText('Reference Pose Overlay', 20, 80);
+    }
   };
 
   // Function to continuously display mirrored video without pose detection
@@ -639,12 +686,62 @@ export default function Workouts() {
       
       // Display detection status
       if (results.landmarks && results.landmarks.length > 0) {
-        // Draw detections
-        const landmarks = results.landmarks[0];
+        // Get the original landmarks
+        const currentLandmarks = results.landmarks[0];
         
-        // Draw connections and landmarks
+        // Initialize smoothed landmarks if needed
+        if (smoothedLandmarks.current.length === 0) {
+          // First frame, just use current landmarks
+          smoothedLandmarks.current = Array(smoothingWindowSize).fill([...currentLandmarks]);
+        } else {
+          // Add current landmarks to the buffer
+          smoothedLandmarks.current.push([...currentLandmarks]);
+          // Remove oldest entry if buffer is full
+          if (smoothedLandmarks.current.length > smoothingWindowSize) {
+            smoothedLandmarks.current.shift();
+          }
+        }
+        
+        // Create smoothed version by averaging across frames
+        const smoothed = currentLandmarks.map((_, i) => {
+          // For each landmark position
+          const avgX = smoothedLandmarks.current.reduce((sum, frame) => 
+            sum + (frame[i]?.x || 0), 0) / smoothedLandmarks.current.length;
+          const avgY = smoothedLandmarks.current.reduce((sum, frame) => 
+            sum + (frame[i]?.y || 0), 0) / smoothedLandmarks.current.length;
+          const avgZ = smoothedLandmarks.current.reduce((sum, frame) => 
+            sum + (frame[i]?.z || 0), 0) / smoothedLandmarks.current.length;
+          
+          return {
+            ...currentLandmarks[i],
+            x: avgX,
+            y: avgY,
+            z: avgZ
+          };
+        });
+        
+        // Use smoothed landmarks instead of original
+        const landmarks = smoothed;
+        
+        // Debug log landmarks occasionally
+        if (Math.random() < 0.02) { // 2% chance to log (to avoid flooding console)
+          debugLandmarks("Current pose landmarks", landmarks);
+          
+          if (referencePoseLandmarks.length > currentWorkoutIndex && 
+              referencePoseLandmarks[currentWorkoutIndex]?.landmarks) {
+            debugLandmarks("Reference pose landmarks", 
+              referencePoseLandmarks[currentWorkoutIndex].landmarks);
+          }
+        }
+        
+        // Use smoothed landmarks for drawing
         drawConnections(canvasCtx, landmarks);
         drawLandmarks(canvasCtx, landmarks);
+        
+        // Draw reference pose if in session and show overlay option is enabled
+        if (isSessionActive && showReferenceOverlay) {
+          drawReferencePose(canvasCtx);
+        }
         
         // Get reference pose from the current workout in the plan
         if (planWorkouts[currentWorkoutIndex]) {
@@ -855,8 +952,18 @@ export default function Workouts() {
       return newAccuracies;
     });
     
+    // Play a success sound (if available in browser)
+    try {
+      const audio = new Audio("/success.mp3"); // Create success sound if you have one
+      audio.volume = 0.5;
+      audio.play().catch(e => console.log("Audio play failed, likely due to user interaction requirement"));
+    } catch (e) {
+      // Sound failed, ignore the error
+    }
+    
     // Show completion feedback
     setShowCompletionFeedback(true);
+    setFeedback("Great job! Pose completed successfully!");
     
     // After a delay, move to next pose
     setTimeout(() => {
@@ -868,15 +975,37 @@ export default function Workouts() {
         console.log("Moving to next pose:", nextIndex + 1, "of", planWorkouts.length);
         
         setCurrentWorkoutIndex(nextIndex);
-        setFeedback(`Next pose: ${planWorkouts[nextIndex].name}`);
+        setFeedback(`Ready for next pose: ${planWorkouts[nextIndex].name}. Get in position!`);
+        
+        // Reset the pose match status for the new pose
+        setIsInCorrectPose(false);
+        
+        // Show a countdown before starting the next pose evaluation
+        let countdown = 3;
+        const countdownInterval = setInterval(() => {
+          if (countdown > 0) {
+            setFeedback(`Get ready for: ${planWorkouts[nextIndex].name}. Starting in ${countdown}...`);
+            countdown--;
+          } else {
+            clearInterval(countdownInterval);
+            setFeedback(`Now match the pose: ${planWorkouts[nextIndex].name}`);
+          }
+        }, 1000);
+        
       } else {
         // All poses completed
         console.log("All poses completed successfully");
-        setFeedback("Workout complete! All poses completed successfully.");
+        setFeedback("🎉 Workout complete! All poses completed successfully. 🎉");
         
         // End the session 
         setTimeout(() => {
           setIsSessionActive(false);
+          // Show summary of the workout
+          const avgAccuracy = poseAccuracies.length > 0 
+            ? Math.round(poseAccuracies.reduce((sum, acc) => sum + acc, 0) / poseAccuracies.length) 
+            : 0;
+          
+          setFeedback(`Workout Summary: Completed ${poseAccuracies.length} poses with ${avgAccuracy}% average accuracy!`);
         }, 1000);
       }
     }, 1500); // Show checkmark for 1.5 seconds
@@ -901,6 +1030,10 @@ export default function Workouts() {
         // Continue countdown
         setHoldTimer(holdTimer - 1);
         console.log(`Hold timer: ${holdTimer - 1} seconds remaining`);
+        // Add some encouraging feedback as the hold progresses
+        if (holdTimer === 2) { // When there are 2 seconds left
+          setFeedback("Almost there! Keep holding the pose...");
+        }
       } else {
         // Timer complete, call completion function
         console.log("Hold complete! Starting completion process");
@@ -1177,23 +1310,134 @@ export default function Workouts() {
       // Try to fetch reference pose landmarks
       try {
         console.log("Fetching reference pose landmarks...");
-        const landmarksSnapshot = await db.collection('users').doc(currentUser?.uid || '')
-          .collection('plans').doc(planId)
-          .collection('poseLandmarks')
-          .orderBy('position')
-          .get();
+        console.log("Query parameters:", {
+          planId,
+          userId: currentUser?.uid,
+          workoutCount: workouts.length
+        });
         
-        if (landmarksSnapshot.docs.length > 0) {
-          const landmarks = landmarksSnapshot.docs.map(doc => doc.data() as StoredPoseLandmarks);
-          console.log(`Found ${landmarks.length} reference poses`);
-          setReferencePoseLandmarks(landmarks);
-        } else {
-          console.warn("No reference landmarks found, will use approximated poses");
-          // Clear any previous reference landmarks
-          setReferencePoseLandmarks([]);
+        // First try fetching from the root-level collection (new storage method)
+        console.log("Attempting to query poseLandmarks collection");
+        const landmarksQuery = db.collection('poseLandmarks')
+          .where('planId', '==', planId)
+          .where('userId', '==', currentUser?.uid);
+          
+        console.log("Query created:", landmarksQuery);
+        
+        try {
+          const landmarksSnapshot = await landmarksQuery.orderBy('position').get();
+          console.log("Query executed successfully", {
+            empty: landmarksSnapshot.empty,
+            size: landmarksSnapshot.size,
+            docs: landmarksSnapshot.docs.length
+          });
+          
+          if (!landmarksSnapshot.empty && landmarksSnapshot.docs.length > 0) {
+            const landmarks = landmarksSnapshot.docs.map((doc: firebase.firestore.QueryDocumentSnapshot) => {
+              const data = doc.data();
+              console.log(`Found landmarks for position ${data.position}:`, {
+                id: doc.id,
+                count: data.landmarks?.length || 0,
+                workoutName: data.workoutName,
+                source: data.source || 'unknown',
+                userId: data.userId,
+                planId: data.planId
+              });
+              return data as StoredPoseLandmarks;
+            });
+            
+            console.log(`Found ${landmarks.length} reference poses from root collection, expected ${workouts.length}`);
+            setReferencePoseLandmarks(landmarks);
+          } else {
+            console.warn("No landmarks found in root collection - will try subcollection");
+            
+            // Try query without orderBy which might be causing issues
+            let simpleSnapshot: firebase.firestore.QuerySnapshot | null = null;
+            try {
+              console.log("Trying simplified query without orderBy");
+              const simpleQuery = db.collection('poseLandmarks')
+                .where('planId', '==', planId)
+                .where('userId', '==', currentUser?.uid);
+                
+              simpleSnapshot = await simpleQuery.get();
+              console.log("Simple query results:", {
+                empty: simpleSnapshot.empty,
+                size: simpleSnapshot.size
+              });
+              
+              if (!simpleSnapshot.empty) {
+                console.log("Simple query found landmarks!");
+                // Process these results instead
+                const landmarks = simpleSnapshot.docs.map(doc => {
+                  const data = doc.data();
+                  return data as StoredPoseLandmarks;
+                });
+                
+                // Sort manually by position
+                landmarks.sort((a: StoredPoseLandmarks, b: StoredPoseLandmarks) => (a.position || 0) - (b.position || 0));
+                console.log(`Found and sorted ${landmarks.length} reference poses`);
+                setReferencePoseLandmarks(landmarks);
+              }
+            } catch (simpleQueryError) {
+              console.error("Error with simplified query:", simpleQueryError);
+            }
+            
+            // Fall back to the old collection path for backward compatibility
+            if (!simpleSnapshot || simpleSnapshot.empty) {
+              console.log("Checking subcollection path as last resort...");
+              try {
+                const oldPathSnapshot = await db.collection('users').doc(currentUser?.uid || '')
+                  .collection('plans').doc(planId)
+                  .collection('poseLandmarks')
+                  .orderBy('position')
+                  .get();
+                
+                console.log("Subcollection query results:", {
+                  empty: oldPathSnapshot.empty,
+                  size: oldPathSnapshot.size
+                });
+                
+                if (!oldPathSnapshot.empty && oldPathSnapshot.docs.length > 0) {
+                  const landmarks = oldPathSnapshot.docs.map(doc => {
+                    const data = doc.data();
+                    console.log(`Found landmarks in subcollection for position ${data.position}:`, {
+                      count: data.landmarks?.length || 0
+                    });
+                    return data as StoredPoseLandmarks;
+                  });
+                  console.log(`Found ${landmarks.length} reference poses in subcollection`);
+                  setReferencePoseLandmarks(landmarks);
+                } else {
+                  console.warn("No reference landmarks found in any collection");
+                  // Clear any previous reference landmarks
+                  setReferencePoseLandmarks([]);
+                }
+              } catch (subcollectionError) {
+                console.error("Error querying subcollection:", subcollectionError);
+                setReferencePoseLandmarks([]);
+              }
+            }
+          }
+        } catch (queryError) {
+          console.error("Error executing landmarks query:", queryError);
+          console.log("Will try alternate queries...");
+          
+          // Add fallback queries here if the main query fails
+          try {
+            // Try a super simple query to test permissions
+            console.log("Testing basic Firestore permissions...");
+            const testQuery = await db.collection('poseLandmarks').limit(1).get();
+            console.log("Basic query result:", {
+              success: true,
+              empty: testQuery.empty,
+              size: testQuery.size
+            });
+          } catch (testError) {
+            console.error("Basic query failed - likely a permissions issue:", testError);
+          }
         }
       } catch (error) {
-        console.error("Error fetching reference landmarks:", error);
+        console.error("Error in landmarks fetching process:", error);
         // Clear any previous reference landmarks
         setReferencePoseLandmarks([]);
       }
@@ -1209,6 +1453,25 @@ export default function Workouts() {
   const handleCloseModal = () => {
     // Allow closing even if not authenticated for workouts page
     setShowAuthModal(false);
+  };
+
+  // Debug function to log landmark data
+  const debugLandmarks = (title: string, landmarks: any[], maxSample: number = 3) => {
+    if (!landmarks || landmarks.length === 0) {
+      console.log(`${title}: No landmarks available`);
+      return;
+    }
+    
+    const sample = landmarks.slice(0, maxSample);
+    const sampleData = sample.map(lm => ({
+      index: lm.index !== undefined ? lm.index : 'N/A',
+      x: typeof lm.x === 'number' ? lm.x.toFixed(4) : 'N/A',
+      y: typeof lm.y === 'number' ? lm.y.toFixed(4) : 'N/A',
+      z: typeof lm.z === 'number' ? lm.z.toFixed(4) : 'N/A',
+      visibility: typeof lm.visibility === 'number' ? lm.visibility.toFixed(2) : 'N/A'
+    }));
+    
+    console.log(`${title} (${landmarks.length} landmarks)`, sampleData);
   };
 
   return (
@@ -1306,6 +1569,16 @@ export default function Workouts() {
               >
                 Choose Your Plan
               </button>
+              {isSessionActive && (
+                <button 
+                  onClick={() => setShowReferenceOverlay(!showReferenceOverlay)}
+                  className={`px-4 py-2 text-white rounded ${
+                    showReferenceOverlay ? 'bg-blue-700' : 'bg-blue-400'
+                  }`}
+                >
+                  {showReferenceOverlay ? 'Hide Reference' : 'Show Reference'}
+                </button>
+              )}
             </div>
           </div>
           
