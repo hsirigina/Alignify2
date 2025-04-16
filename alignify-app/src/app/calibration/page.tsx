@@ -199,8 +199,9 @@ export default function CalibrationPage() {
         const constraints = {
           video: {
             facingMode: "user",
-            width: { ideal: 1280 },
-            height: { ideal: 720 }
+            width: { ideal: 1600 },
+            height: { ideal: 1000 },
+            aspectRatio: 16/10 // Force 16:10 aspect ratio to match workouts page
           }
         };
         
@@ -319,36 +320,39 @@ export default function CalibrationPage() {
       return;
     }
     
-    // Set canvas dimensions to match video
-    const videoWidth = videoRef.current.videoWidth || videoRef.current.clientWidth;
-    const videoHeight = videoRef.current.videoHeight || videoRef.current.clientHeight;
+    // Get the container dimensions (if we're rendering within a container)
+    const containerWidth = canvasRef.current.parentElement?.clientWidth || window.innerWidth;
+    const containerHeight = canvasRef.current.parentElement?.clientHeight || window.innerHeight;
     
-    if (videoWidth <= 0 || videoHeight <= 0) {
-      console.warn("Invalid video dimensions for canvas setup, will retry");
-      setTimeout(setupCanvas, 100);
-      return;
+    // Maintain 16:10 aspect ratio exactly like in workouts page
+    const aspectRatio = 16/10;
+    
+    // Calculate dimensions that maintain aspect ratio within container
+    let newWidth = containerWidth;
+    let newHeight = containerWidth / aspectRatio;
+    
+    // If calculated height exceeds container height, adjust based on height
+    if (newHeight > containerHeight) {
+      newHeight = containerHeight;
+      newWidth = containerHeight * aspectRatio;
     }
     
-    try {
-      // Set canvas dimensions
-      canvasRef.current.width = videoWidth;
-      canvasRef.current.height = videoHeight;
-      
-      console.log(`Canvas dimensions set to ${canvasRef.current.width}x${canvasRef.current.height}`);
-      
-      // Draw a test rectangle to verify canvas is working
-      const ctx = canvasRef.current.getContext('2d');
-      if (ctx) {
-        ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
-        ctx.fillRect(20, 20, 60, 60);
-        ctx.fillStyle = 'white';
-        ctx.font = '14px Arial';
-        ctx.fillText('Canvas Ready', 25, 50);
-      } else {
-        console.error("Could not get canvas context");
-      }
-    } catch (err) {
-      console.error("Error setting up canvas:", err);
+    // Set canvas to these dimensions
+    canvasRef.current.width = newWidth;
+    canvasRef.current.height = newHeight;
+    
+    console.log(`Canvas resized to ${canvasRef.current.width}x${canvasRef.current.height} with aspect ratio ${aspectRatio}`);
+    
+    // Draw a test rectangle to verify canvas is working
+    const ctx = canvasRef.current.getContext('2d');
+    if (ctx) {
+      ctx.fillStyle = 'rgba(255, 0, 0, 0.5)';
+      ctx.fillRect(20, 20, 60, 60);
+      ctx.fillStyle = 'white';
+      ctx.font = '14px Arial';
+      ctx.fillText('Canvas Ready', 25, 50);
+    } else {
+      console.error("Could not get canvas context");
     }
   };
 
@@ -433,12 +437,38 @@ export default function CalibrationPage() {
       canvasCtx.scale(-1, 1);
       canvasCtx.translate(-canvasRef.current.width, 0);
       
-      // Draw the video frame onto the canvas
+      // Calculate dimensions to maintain aspect ratio
+      const videoWidth = videoRef.current.videoWidth;
+      const videoHeight = videoRef.current.videoHeight;
+      const canvasWidth = canvasRef.current.width;
+      const canvasHeight = canvasRef.current.height;
+      
+      let drawWidth = canvasWidth;
+      let drawHeight = canvasHeight;
+      let offsetX = 0;
+      let offsetY = 0;
+      
+      // Calculate dimensions to fill canvas while maintaining aspect ratio
+      const videoRatio = videoWidth / videoHeight;
+      const canvasRatio = canvasWidth / canvasHeight;
+      
+      if (videoRatio > canvasRatio) {
+        // Video is wider than canvas (relative to height)
+        drawHeight = canvasHeight;
+        drawWidth = drawHeight * videoRatio;
+        offsetX = -(drawWidth - canvasWidth) / 2;
+      } else {
+        // Video is taller than canvas (relative to width)
+        drawWidth = canvasWidth;
+        drawHeight = drawWidth / videoRatio;
+        offsetY = -(drawHeight - canvasHeight) / 2;
+      }
+      
+      // Draw the video frame onto the canvas - exactly like in workouts page
       canvasCtx.drawImage(
         videoRef.current, 
-        0, 0, 
-        canvasRef.current.width, 
-        canvasRef.current.height
+        offsetX, offsetY, 
+        drawWidth, drawHeight
       );
       
       // Restore the canvas state for drawing landmarks without flipping them again

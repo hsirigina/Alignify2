@@ -66,6 +66,9 @@ export default function Workouts() {
   const smoothedLandmarks = useRef<Array<any[]>>([]);
   const smoothingWindowSize = 5; // Number of frames to average
   
+  // Add a ref for completePose to avoid dependency cycles
+  const completePoseRef = useRef<() => void>(() => {});
+  
   const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
   const [calibratedPose, setCalibratedPose] = useState<any>(null);
   const [poseMatchFeedback, setPoseMatchFeedback] = useState<{[key: string]: number}>({});
@@ -275,16 +278,67 @@ export default function Workouts() {
       
       // Draw reference pose with transparency
       ctx.globalAlpha = 0.3; // Set transparency
-      drawConnections(ctx, referencePose, '#0000FF'); // Blue for reference
-      drawLandmarks(ctx, referencePose, '#0000FF');
-      ctx.globalAlpha = 1.0; // Reset transparency
       
-      // Add a small label
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-      ctx.fillRect(10, 60, 140, 30);
-      ctx.fillStyle = 'white';
-      ctx.font = '14px Arial';
-      ctx.fillText('Reference Pose Overlay', 20, 80);
+      // Use a fixed position and scaling for the reference pose to make it static
+      
+      // First, draw a semi-transparent background to make the reference pose stand out
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+      ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      
+      // Draw the connections and landmarks with the proper scaling and centered position
+      const canvasWidth = ctx.canvas.width;
+      const canvasHeight = ctx.canvas.height;
+      
+      // Override the drawConnections and drawLandmarks for the reference pose only
+      const staticDrawConnections = (connections: [number, number][] = [
+        // Torso
+        [11, 12], [12, 24], [24, 23], [23, 11],
+        // Left arm
+        [11, 13], [13, 15], [15, 17], [15, 19], [15, 21],
+        // Right arm
+        [12, 14], [14, 16], [16, 18], [16, 20], [16, 22],
+        // Left leg
+        [23, 25], [25, 27], [27, 29], [27, 31],
+        // Right leg
+        [24, 26], [26, 28], [28, 30], [28, 32]
+      ]) => {
+        ctx.strokeStyle = '#0000FF'; // Blue for reference
+        ctx.lineWidth = 3;
+
+        connections.forEach(([start, end]) => {
+          if (referencePose[start] && referencePose[end]) {
+            const startX = canvasWidth - (referencePose[start].x * canvasWidth);
+            const startY = referencePose[start].y * canvasHeight;
+            const endX = canvasWidth - (referencePose[end].x * canvasWidth);
+            const endY = referencePose[end].y * canvasHeight;
+            
+            ctx.beginPath();
+            ctx.moveTo(startX, startY);
+            ctx.lineTo(endX, endY);
+            ctx.stroke();
+          }
+        });
+      };
+      
+      // Draw the reference landmarks in a static position
+      const staticDrawLandmarks = () => {
+        referencePose.forEach((landmark: any) => {
+          ctx.beginPath();
+          const mirroredX = canvasWidth - (landmark.x * canvasWidth);
+          ctx.arc(mirroredX, landmark.y * canvasHeight, 8, 0, 2 * Math.PI);
+          ctx.fillStyle = '#0000FF'; // Blue for reference
+          ctx.fill();
+          ctx.strokeStyle = '#FFFFFF';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        });
+      };
+      
+      // Draw the static reference pose
+      staticDrawConnections();
+      staticDrawLandmarks();
+      
+      ctx.globalAlpha = 1.0; // Reset transparency
     }
   };
 
@@ -345,13 +399,6 @@ export default function Workouts() {
           
           // Restore canvas state
           canvasCtx.restore();
-          
-          // Add a subtle indicator that the canvas is active but not in session
-          canvasCtx.fillStyle = 'rgba(0, 0, 255, 0.1)';
-          canvasCtx.fillRect(10, 10, 220, 40);
-          canvasCtx.fillStyle = 'white';
-          canvasCtx.font = '20px Arial';
-          canvasCtx.fillText('Waiting to Start Session', 20, 35);
         }
       }
       
@@ -671,13 +718,6 @@ export default function Workouts() {
       // Restore the canvas state for drawing landmarks without flipping them again
       canvasCtx.restore();
       
-      // Add a subtle indicator that the canvas is active
-      canvasCtx.fillStyle = 'rgba(255, 0, 0, 0.1)';
-      canvasCtx.fillRect(10, 10, 200, 40);
-      canvasCtx.fillStyle = 'white';
-      canvasCtx.font = '20px Arial';
-      canvasCtx.fillText('Canvas Active', 20, 35);
-      
       // Get current timestamp
       const startTimeMs = performance.now();
       
@@ -940,76 +980,80 @@ export default function Workouts() {
     }
   };
 
-  // Function to handle pose completion
-  const completePose = () => {
-    console.log("Completing pose:", currentWorkoutIndex + 1, "of", planWorkouts.length);
-    
-    // Record the accuracy for this pose
-    setPoseAccuracies(prev => {
-      const newAccuracies = [...prev];
-      newAccuracies[currentWorkoutIndex] = Math.round(overallSimilarity * 100);
-      console.log("Recording accuracy:", Math.round(overallSimilarity * 100) + "%");
-      return newAccuracies;
-    });
-    
-    // Play a success sound (if available in browser)
-    try {
-      const audio = new Audio("/success.mp3"); // Create success sound if you have one
-      audio.volume = 0.5;
-      audio.play().catch(e => console.log("Audio play failed, likely due to user interaction requirement"));
-    } catch (e) {
-      // Sound failed, ignore the error
-    }
-    
-    // Show completion feedback
-    setShowCompletionFeedback(true);
-    setFeedback("Great job! Pose completed successfully!");
-    
-    // After a delay, move to next pose
-    setTimeout(() => {
-      setShowCompletionFeedback(false);
+  // Set up the completePose function reference
+  useEffect(() => {
+    // Create the completePose function that will be stable across renders
+    completePoseRef.current = () => {
+      console.log("Completing pose:", currentWorkoutIndex + 1, "of", planWorkouts.length);
       
-      // Check if we have more poses to go through
-      if (currentWorkoutIndex < planWorkouts.length - 1) {
-        const nextIndex = currentWorkoutIndex + 1;
-        console.log("Moving to next pose:", nextIndex + 1, "of", planWorkouts.length);
-        
-        setCurrentWorkoutIndex(nextIndex);
-        setFeedback(`Ready for next pose: ${planWorkouts[nextIndex].name}. Get in position!`);
-        
-        // Reset the pose match status for the new pose
-        setIsInCorrectPose(false);
-        
-        // Show a countdown before starting the next pose evaluation
-        let countdown = 3;
-        const countdownInterval = setInterval(() => {
-          if (countdown > 0) {
-            setFeedback(`Get ready for: ${planWorkouts[nextIndex].name}. Starting in ${countdown}...`);
-            countdown--;
-          } else {
-            clearInterval(countdownInterval);
-            setFeedback(`Now match the pose: ${planWorkouts[nextIndex].name}`);
-          }
-        }, 1000);
-        
-      } else {
-        // All poses completed
-        console.log("All poses completed successfully");
-        setFeedback("🎉 Workout complete! All poses completed successfully. 🎉");
-        
-        // End the session 
-        setTimeout(() => {
-          setIsSessionActive(false);
-          // Show summary of the workout
-          const avgAccuracy = poseAccuracies.length > 0 
-            ? Math.round(poseAccuracies.reduce((sum, acc) => sum + acc, 0) / poseAccuracies.length) 
-            : 0;
-          
-          setFeedback(`Workout Summary: Completed ${poseAccuracies.length} poses with ${avgAccuracy}% average accuracy!`);
-        }, 1000);
+      // Record the accuracy for this pose
+      setPoseAccuracies(prev => {
+        const newAccuracies = [...prev];
+        newAccuracies[currentWorkoutIndex] = Math.round(overallSimilarity * 100);
+        console.log("Recording accuracy:", Math.round(overallSimilarity * 100) + "%");
+        return newAccuracies;
+      });
+      
+      // Play a success sound (if available in browser)
+      try {
+        const audio = new Audio("/success.mp3"); // Create success sound if you have one
+        audio.volume = 0.5;
+        audio.play().catch(e => console.log("Audio play failed, likely due to user interaction requirement"));
+      } catch (e) {
+        // Sound failed, ignore the error
       }
-    }, 1500); // Show checkmark for 1.5 seconds
-  };
+      
+      // Show completion feedback
+      setShowCompletionFeedback(true);
+      setFeedback("Great job! Pose completed successfully!");
+      
+      // After a delay, move to next pose
+      setTimeout(() => {
+        setShowCompletionFeedback(false);
+        
+        // Check if we have more poses to go through
+        if (currentWorkoutIndex < planWorkouts.length - 1) {
+          const nextIndex = currentWorkoutIndex + 1;
+          console.log("Moving to next pose:", nextIndex + 1, "of", planWorkouts.length);
+          
+          setCurrentWorkoutIndex(nextIndex);
+          setFeedback(`Ready for next pose: ${planWorkouts[nextIndex].name}. Get in position!`);
+          
+          // Reset the pose match status for the new pose
+          setIsInCorrectPose(false);
+          
+          // Show a countdown before starting the next pose evaluation
+          let countdown = 3;
+          const countdownInterval = setInterval(() => {
+            if (countdown > 0) {
+              setFeedback(`Get ready for: ${planWorkouts[nextIndex].name}. Starting in ${countdown}...`);
+              countdown--;
+            } else {
+              clearInterval(countdownInterval);
+              setFeedback(`Now match the pose: ${planWorkouts[nextIndex].name}`);
+            }
+          }, 1000);
+          
+        } else {
+          // All poses completed
+          console.log("All poses completed successfully");
+          setFeedback("🎉 Workout complete! All poses completed successfully. 🎉");
+          
+          // End the session 
+          setTimeout(() => {
+            setIsSessionActive(false);
+            // Show summary of the workout
+            const avgAccuracy = poseAccuracies.length > 0 
+              ? Math.round(poseAccuracies.reduce((sum, acc) => sum + acc, 0) / poseAccuracies.length) 
+              : 0;
+            
+            setFeedback(`Workout Summary: Completed ${poseAccuracies.length} poses with ${avgAccuracy}% average accuracy!`);
+          }, 1000);
+        }
+      }, 1500); // Show checkmark for 1.5 seconds
+    };
+  }, [currentWorkoutIndex, overallSimilarity, planWorkouts, setCurrentWorkoutIndex, setFeedback, 
+      setIsInCorrectPose, setIsSessionActive, setPoseAccuracies, setShowCompletionFeedback]);
 
   // Handle the hold timer countdown
   useEffect(() => {
@@ -1038,12 +1082,13 @@ export default function Workouts() {
         // Timer complete, call completion function
         console.log("Hold complete! Starting completion process");
         setHoldTimer(null);
-        completePose();
+        // Use the ref to call the completePose function
+        completePoseRef.current();
       }
     }, 1000);
     
     return () => clearTimeout(timerId);
-  }, [holdTimer, isInCorrectPose, isSessionActive]);
+  }, [holdTimer, isInCorrectPose, isSessionActive, setFeedback, setHoldTimer]);
 
   // Start session function
   const startSession = async () => {
@@ -1209,6 +1254,7 @@ export default function Workouts() {
     
     // Countdown logic
     for (let i = 3; i > 0; i--) {
+      setCalibrationCountdown(i);
       setCalibrationCountdown(i);
       setFeedback(`Hold your pose! Calibrating in ${i} seconds...`);
       await new Promise(resolve => setTimeout(resolve, 1000));
@@ -1476,188 +1522,143 @@ export default function Workouts() {
 
   return (
     <Layout>
-      <div className="flex flex-col items-center">
-        <h1 className="text-2xl font-bold mb-6">Workouts - Pose Guidance</h1>
+      <div className="flex flex-col items-center w-full">
+        <h1 className="text-2xl font-bold mb-4">Workouts - Pose Guidance</h1>
         
         {/* Hidden element to track session state */}
         <div id="session-active-check" data-active={isSessionActive ? 'true' : 'false'} style={{ display: 'none' }}></div>
         
-        <div className="flex w-full gap-4">
-          {/* Left Column - Camera Feed */}
-          <div className="flex flex-col items-center w-[80%]">
-            {/* Webcam Feed Area */}
-            <div ref={containerRef} className="relative w-full h-[75vh] bg-black mb-4 flex items-center justify-center overflow-hidden">
-              <video 
-                ref={videoRef} 
-                autoPlay 
-                playsInline 
-                muted 
-                className="absolute w-full h-full object-contain invisible"
-              />
-              <canvas 
-                ref={canvasRef} 
-                className="z-20 w-full h-full"
-                style={{ display: 'block' }}
-              />
-              
-              {/* Example pose image - Bottom Right (only in active session) */}
-              {isSessionActive && planWorkouts.length > 0 && currentWorkoutIndex < planWorkouts.length && (
-                <div className="absolute bottom-4 right-4 z-30 bg-white p-2 rounded-lg shadow-md w-44 h-44">
-                  <div className="w-full h-full relative">
-                    <img 
-                      src={planWorkouts[currentWorkoutIndex].imageUrl} 
-                      alt={planWorkouts[currentWorkoutIndex].name} 
-                      className="w-full h-full object-cover rounded"
-                      onError={(e) => {
-                        const target = e.target as HTMLImageElement;
-                        target.src = "https://placehold.co/160x160/pink/white?text=Reference+Pose";
-                      }}
-                    />
-                    <div className="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white text-xs p-1">
-                      {planWorkouts[currentWorkoutIndex].name}
-                    </div>
-                  </div>
-                </div>
-              )}
-              
-              {/* Calibration countdown overlay */}
-              {calibrationCountdown && (
-                <div className="absolute inset-0 flex items-center justify-center z-30">
-                  <div className="bg-black bg-opacity-50 rounded-full w-32 h-32 flex items-center justify-center">
-                    <span className="text-6xl text-white font-bold">{calibrationCountdown}</span>
-                  </div>
-                </div>
-              )}
-              
-              {/* Loading indicator */}
-              {isLoading && (
-                <div className="absolute inset-0 flex items-center justify-center z-30 bg-black bg-opacity-50 text-white">
-                  <div className="text-center">
-                    <div className="mb-2">Loading pose detection...</div>
-                    <div className="w-16 h-16 border-t-4 border-blue-500 border-solid rounded-full animate-spin mx-auto"></div>
-                  </div>
-                </div>
-              )}
-            </div>
+        {/* Main Content - Full Width Video */}
+        <div className="w-full flex flex-col items-center">
+          {/* Webcam Feed Area - Larger and Full Width */}
+          <div ref={containerRef} className="relative w-[95%] h-[80vh] bg-black mb-4 flex items-center justify-center overflow-hidden">
+            <video 
+              ref={videoRef} 
+              autoPlay 
+              playsInline 
+              muted 
+              className="absolute w-full h-full object-contain invisible"
+            />
+            <canvas 
+              ref={canvasRef} 
+              className="z-20 w-full h-full"
+              style={{ display: 'block' }}
+            />
             
-            {/* Control Buttons */}
-            <div className="flex space-x-4 mb-4 w-full justify-center">
-              <button 
-                onClick={startSession}
-                disabled={isSessionActive || !selectedPlan}
-                className={`px-4 py-2 text-white rounded ${
-                  isSessionActive || !selectedPlan ? 'bg-gray-400' : 'bg-blue-500 hover:bg-blue-600'
-                }`}
-              >
-                Start Session
-              </button>
-              <button 
-                onClick={endSession}
-                disabled={!isSessionActive}
-                className={`px-4 py-2 text-white rounded ${
-                  !isSessionActive ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
-                }`}
-              >
-                End Session
-              </button>
-              <button 
-                onClick={() => setShowPlanModal(true)}
-                disabled={isSessionActive}
-                className={`px-4 py-2 text-white rounded ${
-                  isSessionActive ? 'bg-gray-400' : 'bg-green-500 hover:bg-green-600'
-                }`}
-              >
-                Choose Your Plan
-              </button>
-              {isSessionActive && (
-                <button 
-                  onClick={() => setShowReferenceOverlay(!showReferenceOverlay)}
-                  className={`px-4 py-2 text-white rounded ${
-                    showReferenceOverlay ? 'bg-blue-700' : 'bg-blue-400'
-                  }`}
-                >
-                  {showReferenceOverlay ? 'Hide Reference' : 'Show Reference'}
-                </button>
-              )}
-            </div>
-          </div>
-          
-          {/* Right Column - Feedback and Information */}
-          <div className="w-[30%] flex flex-col">
-            {/* Current Workout Info */}
-            {selectedPlan && (
-              <div className="bg-white p-4 rounded-lg shadow-md mb-4">
-                <h2 className="text-xl font-bold mb-3">Current Plan</h2>
-                <div className="flex items-start">
-                  <div className="w-24 h-24 bg-gray-200 rounded-md overflow-hidden mr-4 flex-shrink-0">
-                    {selectedPlan.imageUrl ? (
-                      <img src={selectedPlan.imageUrl} alt={selectedPlan.name} className="w-full h-full object-cover" />
-                    ) : (
-                      <div className="flex items-center justify-center h-full text-xs text-gray-500">No image</div>
-                    )}
+            {/* Example pose image - Top Right Corner (only in active session) */}
+            {isSessionActive && planWorkouts.length > 0 && currentWorkoutIndex < planWorkouts.length && (
+              <div className="absolute top-4 right-4 z-30 bg-white p-2 rounded-lg shadow-md w-[260px]">
+                {/* Plan info moved from top-left to here */}
+                {selectedPlan && (
+                  <div className="mb-2 border-b pb-1">
+                    <p className="font-semibold">{selectedPlan.name} ({currentWorkoutIndex + 1}/{planWorkouts.length})</p>
+                    <p className="text-sm text-gray-700">Pose: {planWorkouts[currentWorkoutIndex]?.name}</p>
                   </div>
-                  <div className="flex-1">
-                    <p className="font-semibold text-lg">{selectedPlan.name}</p>
-                    <p className="text-sm text-gray-600 mb-2">
-                      {currentWorkoutIndex + 1} of {planWorkouts.length} workouts
-                    </p>
-                    
-                    {planWorkouts.length > 0 && currentWorkoutIndex < planWorkouts.length && (
-                      <div className="mt-2 pt-2 border-t border-gray-200">
-                        <div className="font-medium">Current Workout:</div>
-                        <div className="text-blue-600 font-medium">{planWorkouts[currentWorkoutIndex]?.name}</div>
-                      </div>
-                    )}
-                  </div>
+                )}
+                <div className="w-full h-48 relative">
+                  <img 
+                    src={planWorkouts[currentWorkoutIndex].imageUrl} 
+                    alt={planWorkouts[currentWorkoutIndex].name} 
+                    className="w-full h-full object-cover rounded"
+                    onError={(e) => {
+                      const target = e.target as HTMLImageElement;
+                      target.src = "https://placehold.co/160x160/pink/white?text=Reference+Pose";
+                    }}
+                  />
                 </div>
               </div>
             )}
             
-            {/* Feedback Panel */}
-            <div className="bg-white p-4 rounded-lg shadow-md mb-4 flex-grow">
-              <p className="text-lg font-semibold mb-2">Status:</p>
-              <p className="whitespace-pre-line">{feedback}</p>
-              {isSessionActive && overallSimilarity > 0 && (
-                <div className="mt-4">
-                  <div className="flex justify-between mb-1 text-sm">
-                    <span>Pose Accuracy</span>
-                    <span>{Math.round(overallSimilarity * 100)}%</span>
-                  </div>
-                  <div className="w-full bg-gray-200 rounded-full h-4 mb-4">
-                    <div 
-                      className={`h-4 rounded-full ${
-                        overallSimilarity > 0.8 ? 'bg-green-500' : 
-                        overallSimilarity > 0.6 ? 'bg-yellow-500' : 'bg-red-500'
-                      }`}
-                      style={{ width: `${Math.round(overallSimilarity * 100)}%` }}
-                    ></div>
-                  </div>
-                  
-                  {/* Individual Joint Feedbacks */}
-                  <h3 className="text-md font-medium mb-2 mt-4">Joint Accuracy</h3>
-                  <div className="space-y-2">
-                    {Object.entries(poseMatchFeedback).map(([joint, score]) => (
-                      <div key={joint}>
-                        <div className="flex justify-between text-xs mb-1">
-                          <span>{joint.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase())}</span>
-                          <span>{Math.round(score * 100)}%</span>
-                        </div>
-                        <div className="w-full bg-gray-200 rounded-full h-2">
-                          <div 
-                            className={`h-2 rounded-full ${
-                              score > 0.8 ? 'bg-green-500' : 
-                              score > 0.6 ? 'bg-yellow-500' : 'bg-red-500'
-                            }`}
-                            style={{ width: `${Math.round(score * 100)}%` }}
-                          ></div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+            {/* Pose Match Progress - Overlay on left side */}
+            {isSessionActive && overallSimilarity > 0 && (
+              <div className="absolute left-0 top-1/2 -translate-y-1/2 z-30 flex flex-col items-center" style={{ width: '40px' }}>
+                <div className="text-white font-bold text-sm text-center mb-1 text-shadow">
+                  {Math.round(overallSimilarity * 100)}%
                 </div>
-              )}
-            </div>
+                
+                <div className="h-[40vh] w-4 bg-gray-700 bg-opacity-70 rounded-full relative">
+                  <div 
+                    className={`w-4 rounded-full absolute bottom-0 ${
+                      overallSimilarity > 0.8 ? 'bg-green-500' : 
+                      overallSimilarity > 0.6 ? 'bg-yellow-500' : 'bg-red-500'
+                    }`}
+                    style={{ height: `${Math.round(overallSimilarity * 100)}%`, opacity: 0.8 }}
+                  ></div>
+                </div>
+                
+                {isInCorrectPose && (
+                  <div className="text-green-400 font-bold text-xs mt-1 text-shadow">✓</div>
+                )}
+              </div>
+            )}
+            
+            {/* Calibration countdown overlay */}
+            {calibrationCountdown && (
+              <div className="absolute inset-0 flex items-center justify-center z-30">
+                <div className="bg-black bg-opacity-50 rounded-full w-32 h-32 flex items-center justify-center">
+                  <span className="text-6xl text-white font-bold">{calibrationCountdown}</span>
+                </div>
+              </div>
+            )}
+            
+            {/* Loading indicator */}
+            {isLoading && (
+              <div className="absolute inset-0 flex items-center justify-center z-30 bg-black bg-opacity-50 text-white">
+                <div className="text-center">
+                  <div className="mb-2">Loading pose detection...</div>
+                  <div className="w-16 h-16 border-t-4 border-blue-500 border-solid rounded-full animate-spin mx-auto"></div>
+                </div>
+              </div>
+            )}
           </div>
+          
+          {/* Control Buttons - Centered below video */}
+          <div className="flex space-x-4 mb-4 justify-center">
+            <button 
+              onClick={startSession}
+              disabled={isSessionActive || !selectedPlan}
+              className={`px-6 py-3 text-white rounded-lg text-lg font-medium ${
+                isSessionActive || !selectedPlan ? 'bg-gray-400' : 'bg-blue-500 hover:bg-blue-600'
+              }`}
+            >
+              Start Session
+            </button>
+            <button 
+              onClick={endSession}
+              disabled={!isSessionActive}
+              className={`px-6 py-3 text-white rounded-lg text-lg font-medium ${
+                !isSessionActive ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
+              }`}
+            >
+              End Session
+            </button>
+            <button 
+              onClick={() => setShowPlanModal(true)}
+              disabled={isSessionActive}
+              className={`px-6 py-3 text-white rounded-lg text-lg font-medium ${
+                isSessionActive ? 'bg-gray-400' : 'bg-green-500 hover:bg-green-600'
+              }`}
+            >
+              Choose Your Plan
+            </button>
+            {isSessionActive && (
+              <button 
+                onClick={() => setShowReferenceOverlay(!showReferenceOverlay)}
+                className={`px-6 py-3 text-white rounded-lg text-lg font-medium ${
+                  showReferenceOverlay ? 'bg-blue-700' : 'bg-blue-400'
+                }`}
+              >
+                {showReferenceOverlay ? 'Hide Reference' : 'Show Reference'}
+              </button>
+            )}
+          </div>
+          
+          {/* Non-session feedback message */}
+          {!isSessionActive && (
+            <div className="bg-white p-4 rounded-lg shadow-md mb-4 w-[80%] text-center">
+              <p className="whitespace-pre-line">{feedback}</p>
+            </div>
+          )}
         </div>
       </div>
       
@@ -1725,6 +1726,13 @@ export default function Workouts() {
           </div>
         </div>
       )}
+
+      {/* Add text-shadow style to the head */}
+      <style jsx global>{`
+        .text-shadow {
+          text-shadow: 0px 0px 3px rgba(0,0,0,0.8), 0px 0px 2px rgba(0,0,0,1);
+        }
+      `}</style>
     </Layout>
   );
 } 
