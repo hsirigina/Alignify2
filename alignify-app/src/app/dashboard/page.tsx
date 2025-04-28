@@ -1,11 +1,20 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import Layout from "@/components/Layout";
 import AuthModal from "@/components/AuthModal";
 import { useAuth } from "@/contexts/AuthContext";
+import { db } from "@/lib/firebase";
+import { format, startOfWeek, endOfWeek, eachDayOfInterval, parseISO, isWithinInterval, subWeeks, isAfter } from "date-fns";
+import { 
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, 
+  Legend, ResponsiveContainer, PieChart, Pie, Cell, BarChart, 
+  Bar, RadarChart, PolarGrid, PolarAngleAxis, Radar 
+} from "recharts";
 
 export default function Dashboard() {
+  const router = useRouter();
   const [showAuthModal, setShowAuthModal] = useState(false);
   const { currentUser, loading } = useAuth();
 

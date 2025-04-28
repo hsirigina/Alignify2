@@ -55,7 +55,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       if (user) {
         await user.updateProfile({ displayName });
         
-        // Create a user document in Firestore
+        // Create a user document in Firestore with enhanced stats
         await db.collection('users').doc(user.uid).set({
           uid: user.uid,
           email,
@@ -66,7 +66,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
           stats: {
             workoutsCompleted: 0,
             plansCompleted: 0,
+            totalDuration: 0,
             averageAccuracy: 0,
+            streakDays: 0,
+            lastWorkoutDate: null,
+            favoriteWorkouts: [],
+            challengingPoses: [],
+            bodyFocusDistribution: {
+              upper: 0,
+              lower: 0,
+              full: 0
+            },
+            weeklyActivity: {}
           },
         });
       }
@@ -101,7 +112,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
         const userDoc = await db.collection('users').doc(user.uid).get();
         
         if (!userDoc.exists) {
-          // Create a user document in Firestore for new Google users
+          // Create a user document in Firestore for new Google users with enhanced stats
           await db.collection('users').doc(user.uid).set({
             uid: user.uid,
             email: user.email,
@@ -112,7 +123,18 @@ export function AuthProvider({ children }: AuthProviderProps) {
             stats: {
               workoutsCompleted: 0,
               plansCompleted: 0,
+              totalDuration: 0,
               averageAccuracy: 0,
+              streakDays: 0,
+              lastWorkoutDate: null,
+              favoriteWorkouts: [],
+              challengingPoses: [],
+              bodyFocusDistribution: {
+                upper: 0,
+                lower: 0,
+                full: 0
+              },
+              weeklyActivity: {}
             },
           });
         }

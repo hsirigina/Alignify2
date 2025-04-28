@@ -1,15 +1,15 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useState, useEffect, useRef } from 'react';
 import { FilesetResolver, PoseLandmarker } from "@mediapipe/tasks-vision";
 import Layout from "@/components/Layout";
 import { useAuth } from "@/contexts/AuthContext";
-import { doc, updateDoc, arrayUnion, getDoc, setDoc, serverTimestamp } from "firebase/firestore";
+import { doc, updateDoc, serverTimestamp, increment, collection, setDoc } from "firebase/firestore";
 import { db } from "@/lib/firebase";
 import AuthModal from "@/components/AuthModal";
 import { useRouter } from "next/navigation";
+import { NormalizedLandmark } from "@mediapipe/tasks-vision";
 import firebase from "firebase/compat/app";
-import "firebase/compat/firestore";
 
 // Define interfaces for landmarks
 interface PoseLandmark {
@@ -64,12 +64,16 @@ export default function Workouts() {
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const animationFrameRef = useRef<number | null>(null);
   const smoothedLandmarks = useRef<Array<any[]>>([]);
-  const smoothingWindowSize = 5; // Number of frames to average
+  const smoothingWindowSize = 10; // Increased from 5 to 15 for greater smoothing
+  
+  // Add a new ref for smoothed angles
+  const smoothedAngles = useRef<Array<{[key: string]: number}>>([]);
+  const anglesSmoothingWindowSize = 10; // Separate smoothing window for angles
   
   // Add a ref for completePose to avoid dependency cycles
   const completePoseRef = useRef<() => void>(() => {});
   
-  const [isSessionActive, setIsSessionActive] = useState<boolean>(false);
+  const [isSessionActive, setIsSessionActive] = useState(false);
   const [calibratedPose, setCalibratedPose] = useState<any>(null);
   const [poseMatchFeedback, setPoseMatchFeedback] = useState<{[key: string]: number}>({});
   const [overallSimilarity, setOverallSimilarity] = useState<number>(0);
@@ -82,143 +86,331 @@ export default function Workouts() {
   const [selectedPlan, setSelectedPlan] = useState<Plan | null>(null);
   const [currentWorkoutIndex, setCurrentWorkoutIndex] = useState<number>(0);
   const [planWorkouts, setPlanWorkouts] = useState<Workout[]>([]);
-  const [holdTimer, setHoldTimer] = useState<number | null>(null);
   const [isInCorrectPose, setIsInCorrectPose] = useState<boolean>(false);
   const [showCompletionFeedback, setShowCompletionFeedback] = useState<boolean>(false);
-  const [poseHoldDuration, setPoseHoldDuration] = useState<number>(3); // Reduced to 3 seconds for testing
+  const [poseHoldDuration, setPoseHoldDuration] = useState<number>(3); // No longer used for progressive hold
   const [showReferenceOverlay, setShowReferenceOverlay] = useState(true); // Default to showing the overlay
+  
+  // New state variables for progressive pose hold
+  const [cumulativeHoldTime, setCumulativeHoldTime] = useState<number>(0);
+  const [totalRequiredHoldTime, setTotalRequiredHoldTime] = useState(4.0); // Seconds to hold a pose
+  const [holdProgress, setHoldProgress] = useState(0);
+  const [lastHoldTimestamp, setLastHoldTimestamp] = useState<number | null>(null);
+  
+  // Additional refs for pose tracking
+  const lastTimestampRef = useRef<number | null>(null);
+  const cumulativeTimeRef = useRef<number>(0);
+  const isInCorrectPoseRef = useRef<boolean>(false);
+  const feedbackTimerRef = useRef<number | null>(null);
+
   const { currentUser } = useAuth();
   const router = useRouter();
 
   // State for tracking workout metrics
-  const [workoutStartTime, setWorkoutStartTime] = useState<number | null>(null);
+  const [workoutStartTime, setWorkoutStartTime] = useState(0);
   const [poseAccuracies, setPoseAccuracies] = useState<number[]>([]);
   const [referencePoseLandmarks, setReferencePoseLandmarks] = useState<StoredPoseLandmarks[]>([]);
 
-  // Define key joint angles to compare (triplets of points forming angles)
+  const [sessionStartTime, setSessionStartTime] = useState(0);
+
+  // Define the key joint angles to compare for pose matching
   const jointAngles: { [key: string]: number[] } = {
-    leftElbow: [11, 13, 15], // shoulder, elbow, wrist
-    rightElbow: [12, 14, 16], // shoulder, elbow, wrist
-    leftShoulder: [13, 11, 23], // elbow, shoulder, hip
-    rightShoulder: [14, 12, 24], // elbow, shoulder, hip
-    leftHip: [11, 23, 25], // shoulder, hip, knee
-    rightHip: [12, 24, 26], // shoulder, hip, knee
-    leftKnee: [23, 25, 27], // hip, knee, ankle
-    rightKnee: [24, 26, 28], // hip, knee, ankle
+    // Upper body
+    left_elbow: [15, 13, 11],    // wrist, elbow, shoulder
+    left_shoulder: [13, 11, 23], // elbow, shoulder, hip
+    right_elbow: [16, 14, 12],   // wrist, elbow, shoulder
+    right_shoulder: [14, 12, 24], // elbow, shoulder, hip
+    
+    // Lower body
+    left_hip: [11, 23, 25],     // shoulder, hip, knee
+    left_knee: [23, 25, 27],    // hip, knee, ankle
+    right_hip: [12, 24, 26],    // shoulder, hip, knee
+    right_knee: [24, 26, 28]    // hip, knee, ankle
   };
 
-  // Calculate the angle between three points (in radians)
-  const calculateAngle = (p1: any, p2: any, p3: any) => {
-    if (!p1 || !p2 || !p3) return null;
+  // Add alternative angle calculations for upper body mode
+  // These create vertical reference points when full body isn't visible
+  const createVirtualReferencePoints = (landmarks: PoseLandmark[]) => {
+    const virtualPoints: {[key: string]: PoseLandmark} = {};
     
-    // Calculate vectors
-    const vector1 = {
-      x: p1.x - p2.x,
-      y: p1.y - p2.y,
-      z: p1.z - p2.z
-    };
+    // Create virtual points for upper body mode
+    // For shoulders, create points directly below the shoulders
+    if (landmarks[11]) { // Left shoulder
+      virtualPoints['virtual_left_hip'] = {
+        x: landmarks[11].x,
+        y: landmarks[11].y + 0.2, // Point directly below left shoulder
+        z: landmarks[11].z
+      };
+    }
     
-    const vector2 = {
-      x: p3.x - p2.x,
-      y: p3.y - p2.y,
-      z: p3.z - p2.z
-    };
+    if (landmarks[12]) { // Right shoulder
+      virtualPoints['virtual_right_hip'] = {
+        x: landmarks[12].x,
+        y: landmarks[12].y + 0.2, // Point directly below right shoulder
+        z: landmarks[12].z
+      };
+    }
     
-    // Calculate dot product
-    const dotProduct = 
-      vector1.x * vector2.x + 
-      vector1.y * vector2.y + 
-      vector1.z * vector2.z;
+    // Create virtual points for lower body mode
+    // For hips, create points directly above the hips
+    if (landmarks[23]) { // Left hip
+      virtualPoints['virtual_left_shoulder'] = {
+        x: landmarks[23].x,
+        y: landmarks[23].y - 0.2, // Point directly above left hip
+        z: landmarks[23].z
+      };
+    }
     
-    // Calculate magnitudes
-    const magnitude1 = Math.sqrt(
-      vector1.x * vector1.x + 
-      vector1.y * vector1.y + 
-      vector1.z * vector1.z
-    );
+    if (landmarks[24]) { // Right hip
+      virtualPoints['virtual_right_shoulder'] = {
+        x: landmarks[24].x,
+        y: landmarks[24].y - 0.2, // Point directly above right hip
+        z: landmarks[24].z
+      };
+    }
     
-    const magnitude2 = Math.sqrt(
-      vector2.x * vector2.x + 
-      vector2.y * vector2.y + 
-      vector2.z * vector2.z
-    );
-    
-    // Handle zero magnitudes to avoid division by zero
-    if (magnitude1 === 0 || magnitude2 === 0) return null;
-    
-    // Calculate angle using dot product formula
-    // Clamp the value to avoid floating-point errors
-    const cosAngle = Math.max(-1, Math.min(1, dotProduct / (magnitude1 * magnitude2)));
-    const angle = Math.acos(cosAngle);
-    
-    return angle;
+    return virtualPoints;
   };
 
-  // Compare two poses using joint angles and return detailed feedback
+  // Define angle mappings for different body focus modes
+  const upperBodyAngles: { [key: string]: [number | string, number | string, number | string] } = {
+    left_elbow: [15, 13, 11],    // wrist, elbow, shoulder (same)
+    left_shoulder: [13, 11, 'virtual_left_hip'], // elbow, shoulder, virtual point below shoulder
+    right_elbow: [16, 14, 12],   // wrist, elbow, shoulder (same)
+    right_shoulder: [14, 12, 'virtual_right_hip'], // elbow, shoulder, virtual point below shoulder
+  };
+
+  const lowerBodyAngles: { [key: string]: [number | string, number | string, number | string] } = {
+    left_hip: ['virtual_left_shoulder', 23, 25],  // virtual point above hip, hip, knee
+    left_knee: [23, 25, 27],    // hip, knee, ankle (same)
+    right_hip: ['virtual_right_shoulder', 24, 26], // virtual point above hip, hip, knee
+    right_knee: [24, 26, 28]    // hip, knee, ankle (same)
+  };
+
+  // Calculate the angle between three points in degrees
+  const calculateAngle = (a: PoseLandmark, b: PoseLandmark, c: PoseLandmark): number | null => {
+    if (!a || !b || !c) return null;
+    
+    try {
+      // Convert to 3D vectors
+      const ba = {
+        x: a.x - b.x,
+        y: a.y - b.y,
+        z: a.z - b.z
+      };
+      
+      const bc = {
+        x: c.x - b.x,
+        y: c.y - b.y,
+        z: c.z - b.z
+      };
+      
+      // Calculate dot product
+      const dotProduct = ba.x * bc.x + ba.y * bc.y + ba.z * bc.z;
+      
+      // Calculate magnitudes
+      const magnitudeBA = Math.sqrt(ba.x * ba.x + ba.y * ba.y + ba.z * ba.z);
+      const magnitudeBC = Math.sqrt(bc.x * bc.x + bc.y * bc.y + bc.z * bc.z);
+      
+      // Avoid division by zero
+      if (magnitudeBA === 0 || magnitudeBC === 0) {
+        return null;
+      }
+      
+      // Calculate cosine of the angle
+      const cosineAngle = Math.max(-1, Math.min(1, dotProduct / (magnitudeBA * magnitudeBC)));
+      
+      // Convert to degrees
+      const angleRadians = Math.acos(cosineAngle);
+      const angleDegrees = angleRadians * (180 / Math.PI);
+      
+      return angleDegrees;
+    } catch (error) {
+      console.error("Error calculating angle:", error);
+      return null;
+    }
+  };
+
+  // Extract angles from a pose's landmarks
+  const extractAngles = (pose: PoseLandmark[]): { [key: string]: number } => {
+    const angles: { [key: string]: number } = {};
+    
+    // Create virtual reference points based on the visible landmarks
+    const virtualPoints = createVirtualReferencePoints(pose);
+    
+    // Use different angle definitions based on body focus mode
+    const angleDefinitions = bodyFocusMode === 'upper' ? upperBodyAngles : 
+                            bodyFocusMode === 'lower' ? lowerBodyAngles : 
+                            jointAngles;
+    
+    // Calculate angles for each joint using the appropriate definitions
+    for (const [joint, points] of Object.entries(angleDefinitions)) {
+      // Extract the three points needed for the angle
+      const p1 = typeof points[0] === 'number' ? pose[points[0] as number] : virtualPoints[points[0] as string];
+      const p2 = typeof points[1] === 'number' ? pose[points[1] as number] : virtualPoints[points[1] as string];
+      const p3 = typeof points[2] === 'number' ? pose[points[2] as number] : virtualPoints[points[2] as string];
+      
+      if (p1 && p2 && p3) {
+        const angle = calculateAngle(p1, p2, p3);
+        
+        if (angle !== null) {
+          angles[joint] = angle;
+        }
+      }
+    }
+    
+    return angles;
+  };
+
+  // Add a new state variable for body focus mode
+  const [bodyFocusMode, setBodyFocusMode] = useState<'full' | 'upper' | 'lower'>('upper'); // Default to upper body
+
+  // Define joint groups for different body focus modes
+  const upperBodyJoints = ['left_elbow', 'right_elbow', 'left_shoulder', 'right_shoulder'];
+  const lowerBodyJoints = ['left_hip', 'right_hip', 'left_knee', 'right_knee'];
+
+  // Modify the comparePoses function to use smoothed angles
   const comparePoses = (referencePose: any, currentPose: any) => {
+    // Extract angles from both poses
+    const referenceAngles = extractAngles(referencePose);
+    const rawCurrentAngles = extractAngles(currentPose);
+    
+    // Apply smoothing to the current angles
+    const currentAngles = smoothAngles(rawCurrentAngles);
+    
+    // Prepare feedback data
     const feedback: {[key: string]: number} = {};
     let totalSimilarity = 0;
     let availableAngles = 0;
     
-    // For debugging
-    console.log("--- Comparing Poses ---");
+    console.log("--- Comparing Pose Angles ---");
+    console.log(`Body Focus Mode: ${bodyFocusMode}`);
     
-    // Compare angles for each joint
-    for (const [joint, points] of Object.entries(jointAngles)) {
-      const [p1, p2, p3] = points;
-      
-      // Calculate angle for reference pose
-      const referenceAngle = calculateAngle(
-        referencePose[p1], 
-        referencePose[p2], 
-        referencePose[p3]
-      );
-      
-      // Calculate angle for current pose
-      const currentAngle = calculateAngle(
-        currentPose[p1], 
-        currentPose[p2], 
-        currentPose[p3]
-      );
-      
-      // If we can calculate both angles, compare them
-      if (referenceAngle !== null && currentAngle !== null) {
-        // Calculate the difference in angles (in radians)
-        const angleDifference = Math.abs(referenceAngle - currentAngle);
+    // Determine which joints to compare based on bodyFocusMode
+    let jointsToCompare: string[] = [];
+    if (bodyFocusMode === 'full') {
+      jointsToCompare = Object.keys(jointAngles);
+    } else if (bodyFocusMode === 'upper') {
+      jointsToCompare = upperBodyJoints;
+    } else { // lower
+      jointsToCompare = lowerBodyJoints;
+    }
+    
+    // Compare each joint angle
+    for (const joint of jointsToCompare) {
+      if (referenceAngles[joint] !== undefined && currentAngles[joint] !== undefined) {
+        // Calculate the absolute difference in angles
+        const angleDifference = Math.abs(referenceAngles[joint] - currentAngles[joint]);
         
-        // Convert to a similarity score (0-1)
-        // A difference of 0 means perfect match (1.0)
-        // Use a more strict comparison by using PI/4 (45 degrees) as the max difference
-        // This makes it harder to get high scores with moderate differences
-        const similarity = Math.max(0, 1 - (angleDifference / (Math.PI / 4)));
+        // Convert to similarity score (0-1)
+        // Make angle difference more lenient - increase from 60 to 90 degrees
+        const similarity = Math.max(0, 1 - (angleDifference / 90));
         
-        // Apply a curve to make small differences more significant
-        // This makes scoring more challenging as you need to be more precise
-        const adjustedSimilarity = Math.pow(similarity, 1.1);
-        
-        feedback[joint] = adjustedSimilarity;
-        totalSimilarity += adjustedSimilarity;
+        feedback[joint] = similarity;
+        totalSimilarity += similarity;
         availableAngles++;
         
-        // Debug log for specific joints 
-        console.log(`${joint}: Reference=${(referenceAngle * 180 / Math.PI).toFixed(1)}°, Current=${(currentAngle * 180 / Math.PI).toFixed(1)}°, Diff=${(angleDifference * 180 / Math.PI).toFixed(1)}°, Similarity=${(adjustedSimilarity * 100).toFixed(0)}%`);
+        // Log detailed angle comparison
+        console.log(`${joint}: Reference=${referenceAngles[joint].toFixed(1)}°, Current=${currentAngles[joint].toFixed(1)}°, Diff=${angleDifference.toFixed(1)}°, Similarity=${(similarity * 100).toFixed(0)}%`);
       } else {
-        // If we can't calculate one of the angles, mark this joint as not available
-        feedback[joint] = 0;
-        console.log(`${joint}: Could not calculate angles`);
+        console.log(`${joint}: Could not calculate angle (missing landmarks)`);
       }
     }
     
+    // Calculate overall score and match status
     const overallScore = availableAngles > 0 ? totalSimilarity / availableAngles : 0;
-    const isGoodMatch = overallScore >= 0.8;
+    const isGoodMatch = overallScore >= 0.3; // Using 30% threshold instead of 40%
     
-    console.log(`Overall Match: ${(overallScore * 100).toFixed(1)}%, Good Match: ${isGoodMatch}`);
+    console.log(`Overall Match: ${(overallScore * 100).toFixed(1)}%, Good Match: ${isGoodMatch}, Using ${availableAngles} angles`);
     
-    return { 
-      feedback, 
+    return {
+      angles: {
+        reference: referenceAngles,
+        current: currentAngles
+      },
+      feedback,
       overallScore,
-      isGoodMatch 
+      isGoodMatch
     };
+  };
+
+  // Function to save reference angles to Firestore (call this when capturing reference pose)
+  const saveReferenceAngles = async (userId: string, planId: string, workoutId: string, pose: PoseLandmark[], poseName: string) => {
+    try {
+      // Calculate angles from the pose
+      const angles = extractAngles(pose);
+      
+      // Save to Firestore
+      const data = {
+        poseName,
+        angles,
+        poseId: workoutId,
+        planId,
+        workoutId,
+        createdAt: serverTimestamp()
+      };
+      
+      // Save to Firestore
+      await db.collection('poseAngles').add(data);
+      console.log("Reference angles saved for pose:", poseName);
+    } catch (err) {
+      console.error("Error saving reference angles:", err);
+    }
+  };
+
+  // Add a visualization function to draw angles on canvas for debugging
+  const visualizeAngles = (ctx: CanvasRenderingContext2D, landmarks: PoseLandmark[], angles: {[key: string]: number}, similarityScores: {[key: string]: number} = {}) => {
+    for (const [joint, points] of Object.entries(jointAngles)) {
+      const [p1, p2, p3] = points;
+      
+      if (landmarks[p1] && landmarks[p2] && landmarks[p3]) {
+        // Get screen coordinates for the joint points
+        const x1 = ctx.canvas.width - (landmarks[p1].x * ctx.canvas.width);
+        const y1 = landmarks[p1].y * ctx.canvas.height;
+        const x2 = ctx.canvas.width - (landmarks[p2].x * ctx.canvas.width);
+        const y2 = landmarks[p2].y * ctx.canvas.height;
+        const x3 = ctx.canvas.width - (landmarks[p3].x * ctx.canvas.width);
+        const y3 = landmarks[p3].y * ctx.canvas.height;
+        
+        // Calculate vectors
+        const vector1 = { x: x1 - x2, y: y1 - y2 };
+        const vector2 = { x: x3 - x2, y: y3 - y2 };
+        
+        // Calculate angles in screen space
+        const angle1 = Math.atan2(vector1.y, vector1.x);
+        const angle2 = Math.atan2(vector2.y, vector2.x);
+        
+        // Draw arc to visualize the angle
+        const radius = 30;
+        const similarity = similarityScores[joint] || 1.0;
+        
+        // Select color based on similarity score
+        const color = similarity > 0.8 ? 'rgba(0, 255, 0, 0.7)' : 
+                     similarity > 0.6 ? 'rgba(255, 255, 0, 0.7)' : 
+                     'rgba(255, 0, 0, 0.7)';
+        
+        ctx.beginPath();
+        ctx.arc(x2, y2, radius, Math.min(angle1, angle2), Math.max(angle1, angle2));
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 5;
+        ctx.stroke();
+        
+        // Add angle label if we have the angle value
+        if (angles[joint]) {
+          const midAngle = (angle1 + angle2) / 2;
+          const labelX = x2 + (radius + 10) * Math.cos(midAngle);
+          const labelY = y2 + (radius + 10) * Math.sin(midAngle);
+          
+          ctx.font = '12px Arial';
+          ctx.fillStyle = 'white';
+          ctx.strokeStyle = 'black';
+          ctx.lineWidth = 2;
+          ctx.textAlign = 'center';
+          ctx.strokeText(`${Math.round(angles[joint])}°`, labelX, labelY);
+          ctx.fillText(`${Math.round(angles[joint])}°`, labelX, labelY);
+        }
+      }
+    }
   };
 
   // Draw pose landmarks manually using canvas API
@@ -453,6 +645,10 @@ export default function Workouts() {
         poseLandmarkerRef.current = poseLandmarker;
         console.log("PoseLandmarker initialized successfully");
         setIsLoading(false);
+        
+        // Initialize smoothing arrays
+        smoothedLandmarks.current = [];
+        smoothedAngles.current = [];
         
         // Draw a test shape on the canvas to verify it's working
         if (canvasRef.current) {
@@ -837,7 +1033,7 @@ export default function Workouts() {
           }
           
           // Calculate pose similarity against the reference
-          const { feedback: poseFeedback, overallScore, isGoodMatch } = comparePoses(referencePose, landmarks);
+          const { feedback: poseFeedback, overallScore, isGoodMatch, angles } = comparePoses(referencePose, landmarks);
           
           setPoseMatchFeedback(poseFeedback);
           setOverallSimilarity(overallScore);
@@ -847,59 +1043,117 @@ export default function Workouts() {
           
           // Check if pose is correct (above the threshold)
           const wasInCorrectPose = isInCorrectPose;
-          setIsInCorrectPose(isGoodMatch);
+          const isCorrectPose = overallScore >= 0.25; // Lower threshold to 25% (from 60%)
+          setIsInCorrectPose(isCorrectPose);
           
-          // Handle pose hold timing
-          if (isGoodMatch) {
-            // If we just entered the correct pose, start the timer
-            if (!wasInCorrectPose && holdTimer === null) {
-              console.log("Starting pose hold timer!");
-              setHoldTimer(poseHoldDuration);
+          // Draw the angle visualizations
+          if (isSessionActive) {
+            visualizeAngles(canvasCtx, landmarks, angles.current, poseFeedback);
+          }
+          
+          // Handle progressive pose hold time accumulation
+          const now = Date.now();
+          
+          if (isSessionActive) {
+            // Calculate how much to increment based on frame time
+            const frameTime = lastTimestampRef.current ? (now - lastTimestampRef.current) / 1000 : 0;
+            
+            // Only update timestamp if this is first frame or continuing
+            if (!lastTimestampRef.current) {
+              lastTimestampRef.current = now;
+              console.log("Starting hold timer with similarity:", Math.round(overallSimilarity * 100) + "%");
+            } else {
+              // Simplified progress logic - constant rates for increment and decay
+              let increment = 0;
+              
+              // Simple threshold for progress - either making progress or not
+              if (overallScore >= 0.25) {
+                // Fixed increment rate - no bonus, just steady progress
+                // Increase the increment rate to make progress faster
+                increment = frameTime * 1.3; // Increased from 1.0 for faster progress
+                
+                // Apply the increment to our cumulative time
+                cumulativeTimeRef.current = Math.min(totalRequiredHoldTime, cumulativeTimeRef.current + increment);
+                
+                // Calculate and update progress percentage
+                const newProgress = Math.round((cumulativeTimeRef.current / totalRequiredHoldTime) * 100);
+                
+                // Update state for UI rendering
+                setCumulativeHoldTime(cumulativeTimeRef.current);
+                setHoldProgress(newProgress);
+                
+                // Log progress for debugging
+                console.log(`Hold progress: ${newProgress}%, Similarity: ${Math.round(overallSimilarity * 100)}%, Time: ${cumulativeTimeRef.current.toFixed(1)}s/${totalRequiredHoldTime}s, Increment: ${increment.toFixed(3)}`);
+                
+                // If we've reached the required hold time, complete the pose
+                if (cumulativeTimeRef.current >= totalRequiredHoldTime) {
+                  // We just now completed the hold
+                  console.log("Hold complete! Starting completion process");
+                  // Reset the ref values
+                  cumulativeTimeRef.current = 0;
+                  lastTimestampRef.current = null;
+                  
+                  // Make sure we call completePose even if the ref isn't set
+                  if (completePoseRef.current) {
+                    console.log("Calling completePoseRef.current()");
+                    completePoseRef.current();
+                  } else {
+                    console.warn("completePoseRef not set, calling local implementation");
+                    // Fallback implementation
+                    setHoldProgress(0);
+                    
+                    // Record the accuracy for this pose
+                    setPoseAccuracies(prev => {
+                      const newAccuracies = [...prev];
+                      newAccuracies[currentWorkoutIndex] = Math.round(overallSimilarity * 100);
+                      return newAccuracies;
+                    });
+                    
+                    // Move to the next pose if there is one
+                    if (currentWorkoutIndex < planWorkouts.length - 1) {
+                      console.log("Moving to next pose in fallback");
+                      setCurrentWorkoutIndex(currentWorkoutIndex + 1);
+                      setFeedback(`Ready for next pose: ${planWorkouts[currentWorkoutIndex + 1].name}. Get in position!`);
+                    } else {
+                      // Completed all poses
+                      console.log("All poses completed in fallback");
+                      setFeedback("All poses completed! Great job!");
+                      // End the session
+                      endSession(true);
+                    }
+                  }
+                }
+              } else {
+                // Below threshold - decay at the same rate as progress
+                // Reduce decay rate to be more forgiving 
+                const decay = frameTime * 0.8; // Reduced from 1.0 to make progress more sticky
+                cumulativeTimeRef.current = Math.max(0, cumulativeTimeRef.current - decay);
+                
+                // Update state for UI rendering with new decayed value
+                setCumulativeHoldTime(cumulativeTimeRef.current);
+                setHoldProgress(Math.round((cumulativeTimeRef.current / totalRequiredHoldTime) * 100));
+              }
             }
-          } else {
-            // If we're no longer in the correct pose, reset the timer
-            if (holdTimer !== null) {
-              console.log("Resetting pose hold timer - pose lost");
-              setHoldTimer(null);
-            }
+            
+            // Always update timestamp for next frame
+            lastTimestampRef.current = now;
           }
           
           // Generate specific feedback
           let feedbackText = `Overall match: ${Math.round(overallScore * 100)}%\n`;
           
-          for (const [part, score] of Object.entries(poseFeedback)) {
-            const percentage = Math.round(score * 100);
-            if (percentage < 80) {
-              const jointName = part.replace(/([A-Z])/g, ' $1').toLowerCase();
-              
-              // Suggest how to adjust based on the joint
-              let adjustmentText = `Adjust your ${jointName}: ${percentage}% aligned`;
-              
-              // Add specific suggestions (these would be more accurate with real angle comparisons)
-              switch(part) {
-                case 'leftElbow':
-                case 'rightElbow':
-                  adjustmentText += ` (try bending your ${jointName.includes('left') ? 'left' : 'right'} arm more)`;
-                  break;
-                case 'leftShoulder':
-                case 'rightShoulder':
-                  adjustmentText += ` (try raising/lowering your ${jointName.includes('left') ? 'left' : 'right'} arm)`;
-                  break;
-                case 'leftHip':
-                case 'rightHip':
-                  adjustmentText += ` (adjust your torso position)`;
-                  break;
-                case 'leftKnee':
-                case 'rightKnee':
-                  adjustmentText += ` (try bending your ${jointName.includes('left') ? 'left' : 'right'} leg more)`;
-                  break;
-              }
-              
-              feedbackText += `\n${adjustmentText}`;
+          if (isSessionActive) {
+            if (overallScore >= 0.25) {
+              feedbackText = `Correct pose! Hold steady: ${holdProgress}% complete`;
+            } else {
+              // Too far from the reference pose
+              feedbackText = `Try to match the reference pose better (${Math.round(overallScore * 100)}% match)`;
             }
           }
           
-          setFeedback(feedbackText);
+          if (isSessionActive && currentWorkoutIndex < planWorkouts.length) {
+            setFeedback(`${planWorkouts[currentWorkoutIndex].name}: ${feedbackText}`);
+          }
           
           // Color-code landmarks based on match
           Object.entries(poseFeedback).forEach(([part, score]) => {
@@ -927,26 +1181,28 @@ export default function Workouts() {
           });
           
           // Draw the hold timer or completion feedback if needed
-          if (holdTimer !== null) {
+          if (isSessionActive && currentWorkoutIndex < planWorkouts.length) {
             // Draw the current timer number
             canvasCtx.font = 'bold 120px Arial';
             canvasCtx.textAlign = 'center';
             canvasCtx.textBaseline = 'middle';
-            canvasCtx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            canvasCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
             canvasCtx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
             canvasCtx.lineWidth = 4;
-            canvasCtx.strokeText(holdTimer.toString(), canvasCtx.canvas.width / 2, canvasCtx.canvas.height / 2);
-            canvasCtx.fillText(holdTimer.toString(), canvasCtx.canvas.width / 2, canvasCtx.canvas.height / 2);
-          } else if (showCompletionFeedback) {
-            // Draw the completion checkmark
-            canvasCtx.font = 'bold 120px Arial';
-            canvasCtx.textAlign = 'center';
-            canvasCtx.textBaseline = 'middle';
-            canvasCtx.fillStyle = 'rgba(0, 255, 0, 0.8)';
-            canvasCtx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
-            canvasCtx.lineWidth = 4;
-            canvasCtx.strokeText('✓', canvasCtx.canvas.width / 2, canvasCtx.canvas.height / 2);
-            canvasCtx.fillText('✓', canvasCtx.canvas.width / 2, canvasCtx.canvas.height / 2);
+            
+            // Instead, draw the hold progress percentage
+            if (holdProgress > 0) {
+              canvasCtx.strokeText(`${holdProgress}%`, canvasCtx.canvas.width / 2, canvasCtx.canvas.height / 2);
+              canvasCtx.fillText(`${holdProgress}%`, canvasCtx.canvas.width / 2, canvasCtx.canvas.height / 2);
+            }
+          }
+        } else {
+          canvasCtx.fillStyle = 'red';
+          canvasCtx.fillText('No pose detected', 20, 70);
+          
+          // Reset the pose match status if no pose is detected
+          if (isInCorrectPose) {
+            setIsInCorrectPose(false);
           }
         }
       } else {
@@ -956,7 +1212,6 @@ export default function Workouts() {
         // Reset the pose match status if no pose is detected
         if (isInCorrectPose) {
           setIsInCorrectPose(false);
-          setHoldTimer(null);
         }
       }
     } catch (error) {
@@ -986,6 +1241,13 @@ export default function Workouts() {
     completePoseRef.current = () => {
       console.log("Completing pose:", currentWorkoutIndex + 1, "of", planWorkouts.length);
       
+      // Reset hold progress for next pose
+      setCumulativeHoldTime(0);
+      setHoldProgress(0);
+      setLastHoldTimestamp(null);
+      cumulativeTimeRef.current = 0;
+      lastTimestampRef.current = null;
+      
       // Record the accuracy for this pose
       setPoseAccuracies(prev => {
         const newAccuracies = [...prev];
@@ -1003,12 +1265,12 @@ export default function Workouts() {
         // Sound failed, ignore the error
       }
       
-      // Show completion feedback
+      // Show completion feedback with green overlay and checkmark
       setShowCompletionFeedback(true);
       setFeedback("Great job! Pose completed successfully!");
       
       // After a delay, move to next pose
-      setTimeout(() => {
+      feedbackTimerRef.current = window.setTimeout(() => {
         setShowCompletionFeedback(false);
         
         // Check if we have more poses to go through
@@ -1035,62 +1297,36 @@ export default function Workouts() {
           }, 1000);
           
         } else {
-          // All poses completed
+          // All poses completed - properly end the session
           console.log("All poses completed successfully");
           setFeedback("🎉 Workout complete! All poses completed successfully. 🎉");
           
           // End the session 
-          setTimeout(() => {
-            setIsSessionActive(false);
-            // Show summary of the workout
+          feedbackTimerRef.current = window.setTimeout(() => {
+            // Clear any pending animation frame
+            if (animationFrameRef.current) {
+              cancelAnimationFrame(animationFrameRef.current);
+              animationFrameRef.current = null;
+            }
+            
+            // End session and save progress
+            endSession(true);
+            
+            // Show summary of the workout after a brief delay
             const avgAccuracy = poseAccuracies.length > 0 
               ? Math.round(poseAccuracies.reduce((sum, acc) => sum + acc, 0) / poseAccuracies.length) 
               : 0;
             
-            setFeedback(`Workout Summary: Completed ${poseAccuracies.length} poses with ${avgAccuracy}% average accuracy!`);
+            feedbackTimerRef.current = window.setTimeout(() => {
+              setFeedback(`Workout Summary: Completed ${poseAccuracies.length} poses with ${avgAccuracy}% average accuracy!`);
+            }, 1000);
           }, 1000);
         }
       }, 1500); // Show checkmark for 1.5 seconds
     };
-  }, [currentWorkoutIndex, overallSimilarity, planWorkouts, setCurrentWorkoutIndex, setFeedback, 
-      setIsInCorrectPose, setIsSessionActive, setPoseAccuracies, setShowCompletionFeedback]);
+  }, [currentWorkoutIndex, overallSimilarity, planWorkouts, poseAccuracies]);
 
-  // Handle the hold timer countdown
-  useEffect(() => {
-    // Skip if timer is not active or session is not active
-    if (holdTimer === null || !isSessionActive) return;
-    
-    console.log(`Hold timer active: ${holdTimer} seconds remaining`);
-    
-    // Don't start the timer unless we're in the correct pose
-    if (!isInCorrectPose) {
-      console.log("Lost correct pose during hold, resetting timer");
-      setHoldTimer(null);
-      return;
-    }
-    
-    const timerId = setTimeout(() => {
-      if (holdTimer > 1) {
-        // Continue countdown
-        setHoldTimer(holdTimer - 1);
-        console.log(`Hold timer: ${holdTimer - 1} seconds remaining`);
-        // Add some encouraging feedback as the hold progresses
-        if (holdTimer === 2) { // When there are 2 seconds left
-          setFeedback("Almost there! Keep holding the pose...");
-        }
-      } else {
-        // Timer complete, call completion function
-        console.log("Hold complete! Starting completion process");
-        setHoldTimer(null);
-        // Use the ref to call the completePose function
-        completePoseRef.current();
-      }
-    }, 1000);
-    
-    return () => clearTimeout(timerId);
-  }, [holdTimer, isInCorrectPose, isSessionActive, setFeedback, setHoldTimer]);
-
-  // Start session function
+  // Add these functions for starting and ending sessions
   const startSession = async () => {
     if (!selectedPlan || planWorkouts.length === 0) {
       setFeedback("Please select a workout plan first!");
@@ -1103,6 +1339,17 @@ export default function Workouts() {
     }
 
     try {
+      // Reset hold progress values
+      setCumulativeHoldTime(0);
+      setHoldProgress(0);
+      setLastHoldTimestamp(null);
+      cumulativeTimeRef.current = 0;
+      lastTimestampRef.current = null;
+      
+      // Reset smoothing arrays
+      smoothedLandmarks.current = [];
+      smoothedAngles.current = [];
+      
       // Get the current workout reference image
       const currentWorkout = planWorkouts[currentWorkoutIndex];
       
@@ -1127,6 +1374,15 @@ export default function Workouts() {
       setIsSessionActive(true);
       processFrame();
       
+      // Set the session start time to the current timestamp
+      setSessionStartTime(Date.now());
+      
+      // Initialize hold time variables
+      setHoldProgress(0);
+      cumulativeTimeRef.current = 0;
+      lastTimestampRef.current = null;
+      setTotalRequiredHoldTime(8.0); // Reduced from 10 seconds to 8 seconds
+      
     } catch (error) {
       console.error("Error starting session:", error);
       setFeedback("Failed to start session. Please try again.");
@@ -1134,78 +1390,98 @@ export default function Workouts() {
   };
 
   // End session function
-  const endSession = async () => {
+  const endSession = async (shouldSave = true) => {
+    console.log("Ending session");
+    
+    // First, update the state to prevent further animation frames
     setIsSessionActive(false);
-    setFeedback("Session ended");
-    setHoldTimer(null);
+    
+    // Clear the completion feedback to stop the green flashing
     setShowCompletionFeedback(false);
     
-    // Calculate workout duration in minutes
-    const workoutDuration = workoutStartTime 
-      ? Math.round((Date.now() - workoutStartTime) / 60000) // Convert ms to minutes
-      : 0;
-    
-    // If user is authenticated and we have some accuracy data, save the workout session
-    if (currentUser && selectedPlan && poseAccuracies.length > 0) {
-      try {
-        // Calculate average accuracy (round to nearest whole number)
-        const averageAccuracy = Math.round(
-          poseAccuracies.reduce((sum, acc) => sum + acc, 0) / poseAccuracies.length
-        );
-        
-        // Save workout session to Firestore
-        const sessionData = {
-          date: firebase.firestore.FieldValue.serverTimestamp(),
-          planId: selectedPlan.id,
-          planName: selectedPlan.name,
-          completed: currentWorkoutIndex >= planWorkouts.length - 1,
-          posesCompleted: Math.min(currentWorkoutIndex + 1, planWorkouts.length),
-          totalPoses: planWorkouts.length,
-          averageAccuracy: averageAccuracy,
-          duration: workoutDuration,
-          poseResults: poseAccuracies.map((accuracy, index) => ({
-            name: index < planWorkouts.length ? planWorkouts[index].name : `Pose ${index + 1}`,
-            accuracy: accuracy
-          }))
-        };
-        
-        // Add to user's workout history
-        await db.collection('users').doc(currentUser.uid)
-          .collection('workoutHistory')
-          .add(sessionData);
-        
-        // Update user's overall stats
-        const userRef = db.collection('users').doc(currentUser.uid);
-        const userDoc = await userRef.get();
-        
-        if (userDoc.exists) {
-          const userData = userDoc.data() || {};
-          const stats = userData.stats || {};
-          
-          await userRef.update({
-            'stats.workoutsCompleted': (stats.workoutsCompleted || 0) + 1,
-            'stats.totalDuration': (stats.totalDuration || 0) + workoutDuration,
-            'stats.averageAccuracy': Math.round(
-              ((stats.averageAccuracy || 0) * (stats.workoutsCompleted || 0) + averageAccuracy) / 
-              ((stats.workoutsCompleted || 0) + 1)
-            )
-          });
-        }
-        
-        setFeedback(`Session saved! Average accuracy: ${averageAccuracy}%, Duration: ${workoutDuration} min`);
-      } catch (error) {
-        console.error("Error saving workout session:", error);
-        setFeedback("Session ended but failed to save progress.");
-      }
+    // Clear any pending feedback timers that might be causing flashing
+    if (feedbackTimerRef.current) {
+      clearTimeout(feedbackTimerRef.current);
+      feedbackTimerRef.current = null;
     }
     
-    // Restart the continuous video display after ending session
-    setTimeout(() => {
-      if (!isSessionActive) {
-        console.log("Restarting continuous video display after session end");
-        startContinuousVideoDisplay();
+    console.log("Session active state changed: false");
+    
+    // Make this check clearer to see if animation frame was canceled
+    if (animationFrameRef.current) {
+      console.log("Canceling animation frame in endSession:", animationFrameRef.current);
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    } else {
+      console.log("No animation frame to cancel in endSession");
+    }
+    
+    // Update the DOM attribute for tracking
+    const sessionCheckElement = document.getElementById('session-active-check');
+    if (sessionCheckElement) {
+      sessionCheckElement.setAttribute('data-active', 'false');
+    }
+    
+    console.log("Session ended or inactive");
+    
+    // Don't try to save stats if not requested
+    if (!shouldSave || !currentUser || !selectedPlan) {
+      console.log("Skipping session save:", {
+        shouldSave,
+        isUserAuthenticated: !!currentUser,
+        hasPlan: !!selectedPlan
+      });
+      return;
+    }
+    
+    try {
+      // Check if the document exists first before trying to update
+      const workoutDocRef = db.collection('users').doc(currentUser.uid)
+        .collection('workouts').doc(selectedPlan.id);
+      
+      const workoutDoc = await workoutDocRef.get();
+      
+      const sessionDuration = Math.round((Date.now() - sessionStartTime) / 1000);
+      
+      // Create or update the document based on whether it exists
+      if (workoutDoc.exists) {
+        // Update existing document
+        await workoutDocRef.update({
+          lastSessionAt: new Date().toISOString(),
+          sessionsCount: increment(1),
+          totalDuration: increment(sessionDuration),
+          poseAccuracies
+        });
+        console.log("Session stats updated successfully");
+      } else {
+        // Create a new document
+        await workoutDocRef.set({
+          userId: currentUser.uid,
+          planId: selectedPlan.id,
+          planName: selectedPlan.name,
+          firstSessionAt: new Date().toISOString(),
+          lastSessionAt: new Date().toISOString(),
+          sessionsCount: 1,
+          totalDuration: sessionDuration,
+          poseAccuracies
+        });
+        console.log("First session stats created successfully");
       }
-    }, 100);
+      
+      setFeedback("Session ended and progress saved!");
+      // Clear the flashing green by setting a timeout to reset feedback
+      feedbackTimerRef.current = window.setTimeout(() => {
+        setFeedback("");
+      }, 3000);
+      
+    } catch (err) {
+      console.error("Error saving session:", err);
+      setFeedback("Session ended, but there was an error saving your progress.");
+      // Clear the flashing green by setting a timeout to reset feedback
+      feedbackTimerRef.current = window.setTimeout(() => {
+        setFeedback("");
+      }, 3000);
+    }
   };
 
   // Monitor session state changes to properly handle video display
@@ -1379,15 +1655,12 @@ export default function Workouts() {
           });
           
           if (!landmarksSnapshot.empty && landmarksSnapshot.docs.length > 0) {
-            const landmarks = landmarksSnapshot.docs.map((doc: firebase.firestore.QueryDocumentSnapshot) => {
+            const landmarks = landmarksSnapshot.docs.map((doc: any) => {
               const data = doc.data();
               console.log(`Found landmarks for position ${data.position}:`, {
                 id: doc.id,
-                count: data.landmarks?.length || 0,
-                workoutName: data.workoutName,
-                source: data.source || 'unknown',
-                userId: data.userId,
-                planId: data.planId
+                position: data.position,
+                landmarkCount: data.landmarks?.length || 0
               });
               return data as StoredPoseLandmarks;
             });
@@ -1398,7 +1671,7 @@ export default function Workouts() {
             console.warn("No landmarks found in root collection - will try subcollection");
             
             // Try query without orderBy which might be causing issues
-            let simpleSnapshot: firebase.firestore.QuerySnapshot | null = null;
+            let simpleSnapshot: any = null;
             try {
               console.log("Trying simplified query without orderBy");
               const simpleQuery = db.collection('poseLandmarks')
@@ -1414,7 +1687,7 @@ export default function Workouts() {
               if (!simpleSnapshot.empty) {
                 console.log("Simple query found landmarks!");
                 // Process these results instead
-                const landmarks = simpleSnapshot.docs.map(doc => {
+                const landmarks = simpleSnapshot.docs.map((doc: any) => {
                   const data = doc.data();
                   return data as StoredPoseLandmarks;
                 });
@@ -1520,6 +1793,87 @@ export default function Workouts() {
     console.log(`${title} (${landmarks.length} landmarks)`, sampleData);
   };
 
+  // Log details about the body focus mode in use
+  useEffect(() => {
+    console.log(`Body focus mode changed to: ${bodyFocusMode}`);
+    console.log("Angle definitions in use:", 
+      bodyFocusMode === 'upper' ? "Upper body (with virtual points)" : 
+      bodyFocusMode === 'lower' ? "Lower body (with virtual points)" : 
+      "Full body");
+  }, [bodyFocusMode]);
+
+  // Add a new function to smooth angles using moving average
+  const smoothAngles = (currentAngles: {[key: string]: number}): {[key: string]: number} => {
+    // Add current angles to the buffer
+    smoothedAngles.current.push({...currentAngles});
+    
+    // Remove oldest entry if buffer is full
+    if (smoothedAngles.current.length > anglesSmoothingWindowSize) {
+      smoothedAngles.current.shift();
+    }
+    
+    // Create smoothed version by averaging across frames
+    const smoothed: {[key: string]: number} = {};
+    
+    // For each joint angle in the current angles
+    Object.keys(currentAngles).forEach(joint => {
+      // Calculate how many frames have this angle
+      const framesWithAngle = smoothedAngles.current.filter(frame => frame[joint] !== undefined).length;
+      
+      if (framesWithAngle > 0) {
+        // Calculate the average
+        const sum = smoothedAngles.current.reduce((total, frame) => 
+          total + (frame[joint] !== undefined ? frame[joint] : 0), 0);
+        
+        smoothed[joint] = sum / framesWithAngle;
+      } else {
+        // Use current angle if no history
+        smoothed[joint] = currentAngles[joint];
+      }
+    });
+    
+    return smoothed;
+  };
+
+  // Define these variables near the beginning of the component, with other state variables
+  const [poseHoldTimes, setPoseHoldTimes] = useState<{ [key: number]: number }>({});
+  const [poseAttempts, setPoseAttempts] = useState<{ [key: number]: number }>({});
+
+  // Update the savePoseLandmarksToFirebase function
+  const savePoseLandmarksToFirebase = async (
+    landmarks: NormalizedLandmark[], 
+    poseId: number, 
+    similarityScore: number
+  ) => {
+    if (!currentUser) return;
+    
+    try {
+      // Transform landmarks into a serializable format
+      const formattedLandmarks = landmarks.map((landmark: NormalizedLandmark) => ({
+        x: landmark.x,
+        y: landmark.y,
+        z: landmark.z,
+        visibility: landmark.visibility
+      }));
+      
+      // Create a document reference
+      const poseRef = doc(collection(db, `users/${currentUser.uid}/workoutData`));
+      
+      // Save to Firestore
+      await setDoc(poseRef, {
+        landmarks: formattedLandmarks,
+        position: poseId,
+        timestamp: serverTimestamp(),
+        workoutId: selectedPlan?.id, // Use sessionId as the workoutId
+        similarityScore
+      });
+      
+      console.log(`Saved landmarks for pose ${poseId} with score ${similarityScore}`);
+    } catch (error) {
+      console.error("Error saving landmarks:", error);
+    }
+  };
+
   return (
     <Layout>
       <div className="flex flex-col items-center w-full">
@@ -1544,6 +1898,45 @@ export default function Workouts() {
               className="z-20 w-full h-full"
               style={{ display: 'block' }}
             />
+            
+            {/* Pose Hold Progress Bar - Always visible during session */}
+            {isSessionActive && (
+              <div className="absolute bottom-12 left-0 right-0 mx-auto w-[80%] z-30">
+                <div className="text-center mb-2 text-white font-bold text-xl drop-shadow-lg">
+                  Hold Progress: {holdProgress}%
+                </div>
+                <div className="w-full bg-gray-800 bg-opacity-70 rounded-full h-8 overflow-hidden border-2 border-white">
+                  <div 
+                    className={`${
+                      holdProgress > 80 ? 'bg-green-500' : 
+                      holdProgress > 50 ? 'bg-blue-500' : 
+                      holdProgress > 20 ? 'bg-yellow-500' : 'bg-red-500'
+                    } h-full transition-all duration-200 ease-out flex items-center justify-center text-sm font-bold text-white ${
+                      isInCorrectPose ? 'animate-pulse border-r-4 border-white' : ''
+                    }`}
+                    style={{ width: `${holdProgress}%` }}
+                  >
+                    {holdProgress > 5 ? (
+                      <>
+                        {holdProgress}% {isInCorrectPose && (
+                          <span className="ml-1 text-white animate-pulse">
+                            ⏱️ HOLDING!
+                          </span>
+                        )}
+                      </>
+                    ) : ''}
+                  </div>
+                </div>
+                
+                {/* Additional visual indicator when in correct pose */}
+                {isInCorrectPose && (
+                  <div className="text-center mt-2 text-green-400 font-bold text-lg animate-bounce drop-shadow-lg flex items-center justify-center">
+                    <span className="inline-block w-4 h-4 bg-green-500 rounded-full mr-2 animate-ping"></span>
+                    Correct Pose! Keep Holding...
+                  </div>
+                )}
+              </div>
+            )}
             
             {/* Example pose image - Top Right Corner (only in active session) */}
             {isSessionActive && planWorkouts.length > 0 && currentWorkoutIndex < planWorkouts.length && (
@@ -1624,7 +2017,7 @@ export default function Workouts() {
               Start Session
             </button>
             <button 
-              onClick={endSession}
+              onClick={() => endSession()}
               disabled={!isSessionActive}
               className={`px-6 py-3 text-white rounded-lg text-lg font-medium ${
                 !isSessionActive ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
@@ -1641,8 +2034,47 @@ export default function Workouts() {
             >
               Choose Your Plan
             </button>
+            
+            {/* Add Body Focus Mode Toggle */}
+            <div className="flex flex-col items-center justify-center">
+              <span className="text-sm text-gray-200 mb-1">Body Focus</span>
+              <div className="flex space-x-1">
+                <button
+                  onClick={() => setBodyFocusMode('upper')}
+                  className={`px-3 py-1 text-xs rounded ${
+                    bodyFocusMode === 'upper' 
+                      ? 'bg-purple-600 text-white' 
+                      : 'bg-gray-200 text-gray-800 hover:bg-gray-300'
+                  }`}
+                >
+                  Upper
+                </button>
+                <button
+                  onClick={() => setBodyFocusMode('full')}
+                  className={`px-3 py-1 text-xs rounded ${
+                    bodyFocusMode === 'full' 
+                      ? 'bg-purple-600 text-white' 
+                      : 'bg-gray-200 text-gray-800 hover:bg-gray-300'
+                  }`}
+                >
+                  Full
+                </button>
+                <button
+                  onClick={() => setBodyFocusMode('lower')}
+                  className={`px-3 py-1 text-xs rounded ${
+                    bodyFocusMode === 'lower' 
+                      ? 'bg-purple-600 text-white' 
+                      : 'bg-gray-200 text-gray-800 hover:bg-gray-300'
+                  }`}
+                >
+                  Lower
+                </button>
+              </div>
+            </div>
+
+            {/* Add back the Show/Hide Reference button */}
             {isSessionActive && (
-              <button 
+              <button
                 onClick={() => setShowReferenceOverlay(!showReferenceOverlay)}
                 className={`px-6 py-3 text-white rounded-lg text-lg font-medium ${
                   showReferenceOverlay ? 'bg-blue-700' : 'bg-blue-400'
@@ -1733,6 +2165,17 @@ export default function Workouts() {
           text-shadow: 0px 0px 3px rgba(0,0,0,0.8), 0px 0px 2px rgba(0,0,0,1);
         }
       `}</style>
+
+      {/* Completion feedback overlay with checkmark */}
+      {showCompletionFeedback && (
+        <div className="absolute inset-0 bg-green-500 bg-opacity-40 flex items-center justify-center z-30 animate-pulse">
+          <div className="bg-white rounded-full p-4 shadow-lg">
+            <svg className="w-20 h-20 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="4" d="M5 13l4 4L19 7"></path>
+            </svg>
+          </div>
+        </div>
+      )}
     </Layout>
   );
 } 

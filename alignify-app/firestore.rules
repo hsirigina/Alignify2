@@ -1,26 +1,26 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /users/{userId} {
-      allow read, write, delete: if request.auth != null && request.auth.uid == userId;
-      
-      match /plans/{planId} {
-        allow read, write, delete: if request.auth != null && request.auth.uid == userId;
-        
-        match /workouts/{workoutId} {
-          allow read, write, delete: if request.auth != null && request.auth.uid == userId;
-        }
-        
-        match /poseLandmarks/{landmarkId} {
-          allow read, write, delete: if request.auth != null && request.auth.uid == userId;
-        }
-      }
+    // Allow users to read and write their own data
+    match /users/{userId}/{document=**} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
     }
     
-    // Add rules for root-level poseLandmarks collection
-    match /poseLandmarks/{landmarkId} {
+    // Allow users to read and write their own pose landmarks
+    match /poseLandmarks/{docId} {
       allow read: if request.auth != null && resource.data.userId == request.auth.uid;
-      allow write, delete: if request.auth != null && request.resource.data.userId == request.auth.uid;
+      allow create: if request.auth != null && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if request.auth != null && resource.data.userId == request.auth.uid;
+    }
+    
+    // Public data that anyone can read
+    match /public/{document=**} {
+      allow read: if true;
+    }
+    
+    // Default deny all other access
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 } 

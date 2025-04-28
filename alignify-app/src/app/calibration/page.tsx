@@ -1,14 +1,21 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, ChangeEvent } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Layout from '@/components/Layout';
 import { useAuth } from '@/contexts/AuthContext';
-import firebase from 'firebase/compat/app';
-import { FilesetResolver, PoseLandmarker } from '@mediapipe/tasks-vision';
+import { FilesetResolver, PoseLandmarker, NormalizedLandmark as MediaPipeNormalizedLandmark } from '@mediapipe/tasks-vision';
 import { db, storage } from '@/lib/firebase';
+import { getAuth, User } from 'firebase/auth';
+import { useAuthState } from 'react-firebase-hooks/auth';
+import { v4 as uuidv4 } from 'uuid';
+import { ref, uploadBytes, getDownloadURL } from 'firebase/storage';
+import { doc, setDoc, serverTimestamp, collection, addDoc, getDoc, updateDoc, query, where, getDocs, updateDoc as firestoreUpdateDoc } from 'firebase/firestore';
+import { getStorage } from 'firebase/storage';
+import { uploadString } from 'firebase/storage';
+import toast from 'react-hot-toast';
 
-// Define a proper interface for landmarks at the top of the file
+// Define interface for MediaPipe pose landmark
 interface PoseLandmark {
   x: number;
   y: number;
@@ -16,12 +23,55 @@ interface PoseLandmark {
   visibility?: number;
 }
 
+// Define our own interface matching MediaPipe's normalized landmark structure
+interface LocalNormalizedLandmark {
+  x: number;
+  y: number;
+  z?: number;
+  visibility?: number;
+}
+
+// Define interfaces for landmark data
+interface SimpleLandmark {
+  x: number;
+  y: number;
+  z: number;
+  visibility: number;
+}
+
+// Define interface for stored landmarks collection
+interface StoredPoseLandmarks {
+  landmarks: StoredPoseLandmark[];
+  position: number;
+  workoutId: string;
+  timestamp: Date;
+  userId: string;
+  planId: string;
+}
+
+// Define interface for stored pose landmarks
 interface StoredPoseLandmark {
   index: number;
   x: number;
   y: number;
   z: number;
-  visibility: number;
+  visibility?: number;
+}
+
+interface Exercise {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+interface WorkoutPlan {
+  id: string;
+  name: string;
+  description: string;
+  imageUrl?: string;
+  userId: string;
+  exercises: Exercise[];
+  createdAt: any;
 }
 
 export default function CalibrationPage() {
@@ -357,8 +407,8 @@ export default function CalibrationPage() {
   };
 
   // Draw pose landmarks manually using canvas API
-  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: any[]) => {
-    landmarks.forEach((landmark: any) => {
+  const drawLandmarks = (ctx: CanvasRenderingContext2D, landmarks: StoredPoseLandmark[]) => {
+    landmarks.forEach((landmark) => {
       ctx.beginPath();
       const mirroredX = ctx.canvas.width - (landmark.x * ctx.canvas.width);
       ctx.arc(mirroredX, landmark.y * ctx.canvas.height, 8, 0, 2 * Math.PI);
@@ -371,7 +421,7 @@ export default function CalibrationPage() {
   };
 
   // Draw connections between landmarks
-  const drawConnections = (ctx: CanvasRenderingContext2D, landmarks: any[]) => {
+  const drawConnections = (ctx: CanvasRenderingContext2D, landmarks: StoredPoseLandmark[]) => {
     const connections = [
       // Torso
       [11, 12], [12, 24], [24, 23], [23, 11],
@@ -389,11 +439,15 @@ export default function CalibrationPage() {
     ctx.lineWidth = 3;
 
     connections.forEach(([start, end]) => {
-      if (landmarks[start] && landmarks[end]) {
-        const startX = ctx.canvas.width - (landmarks[start].x * ctx.canvas.width);
-        const startY = landmarks[start].y * ctx.canvas.height;
-        const endX = ctx.canvas.width - (landmarks[end].x * ctx.canvas.width);
-        const endY = landmarks[end].y * ctx.canvas.height;
+      // Find landmarks by index
+      const startLandmark = landmarks.find(lm => lm.index === start);
+      const endLandmark = landmarks.find(lm => lm.index === end);
+      
+      if (startLandmark && endLandmark) {
+        const startX = ctx.canvas.width - (startLandmark.x * ctx.canvas.width);
+        const startY = startLandmark.y * ctx.canvas.height;
+        const endX = ctx.canvas.width - (endLandmark.x * ctx.canvas.width);
+        const endY = endLandmark.y * ctx.canvas.height;
         
         ctx.beginPath();
         ctx.moveTo(startX, startY);
@@ -491,7 +545,13 @@ export default function CalibrationPage() {
         
         // Draw pose landmarks if available
         if (results.landmarks && results.landmarks.length > 0) {
-          const currentLandmarks = results.landmarks[0];
+          const currentLandmarks = results.landmarks[0].map((landmark, index) => ({
+            index,
+            x: landmark.x,
+            y: landmark.y,
+            z: landmark.z,
+            visibility: landmark.visibility || 0
+          }));
           
           // Initialize smoothed landmarks if needed
           if (smoothedLandmarks.current.length === 0) {
@@ -507,7 +567,7 @@ export default function CalibrationPage() {
           }
           
           // Create smoothed version by averaging across frames
-          const smoothed = currentLandmarks.map((_, i) => {
+          const smoothed = currentLandmarks.map((landmark, i) => {
             // For each landmark position
             const avgX = smoothedLandmarks.current.reduce((sum, frame) => 
               sum + (frame[i]?.x || 0), 0) / smoothedLandmarks.current.length;
@@ -515,20 +575,26 @@ export default function CalibrationPage() {
               sum + (frame[i]?.y || 0), 0) / smoothedLandmarks.current.length;
             const avgZ = smoothedLandmarks.current.reduce((sum, frame) => 
               sum + (frame[i]?.z || 0), 0) / smoothedLandmarks.current.length;
+            const avgVisibility = smoothedLandmarks.current.reduce((sum, frame) => 
+              sum + (frame[i]?.visibility || 0), 0) / smoothedLandmarks.current.length;
             
             return {
-              ...currentLandmarks[i],
+              index: i,
               x: avgX,
               y: avgY,
-              z: avgZ
+              z: avgZ,
+              visibility: avgVisibility
             };
           });
           
           // Use smoothed landmarks for drawing
-          const landmarks = smoothed;
+          drawConnections(canvasCtx, smoothed as StoredPoseLandmark[]);
+          drawLandmarks(canvasCtx, smoothed as StoredPoseLandmark[]);
           
-          drawConnections(canvasCtx, landmarks);
-          drawLandmarks(canvasCtx, landmarks);
+          // Log number of landmarks for debugging
+          if (isCapturing) {
+            console.log(`Detected ${smoothed.length} pose landmarks during capture`);
+          }
         }
       } else {
         console.warn("Invalid video dimensions, skipping pose detection");
@@ -670,21 +736,37 @@ export default function CalibrationPage() {
       return;
     }
     
-    // Don't cancel animation frame during retake - it should continue
-    console.log("Clearing captured image for retake");
+    // Cancel any ongoing animation frames
+    if (animationFrameRef.current) {
+      console.log("Canceling animation frame for retake:", animationFrameRef.current);
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
     
     // Clear the captured image
     setCapturedImage(null);
     
-    // Brief pause to let state update
-    await new Promise(resolve => setTimeout(resolve, 50));
-    
-    // Make sure animation is running
-    if (!animationFrameRef.current) {
-      console.log("No animation frame during retake, restarting detection");
-      startPoseDetection();
-    } else {
-      console.log("Animation frame already running during retake");
+    try {
+      // Restart the video feed completely
+      console.log("Restarting video feed for retake");
+      const success = await restartVideo();
+      
+      if (success) {
+        console.log("Video feed successfully restarted for retake");
+        
+        // Setup canvas for the new video feed
+        setupCanvas();
+        
+        // Start pose detection again
+        console.log("Restarting pose detection");
+        startPoseDetection();
+      } else {
+        console.error("Failed to restart video feed for retake");
+        setCameraError("Failed to restart camera. Please refresh the page and try again.");
+      }
+    } catch (error) {
+      console.error("Error during retake:", error);
+      setCameraError("An error occurred while retaking the image. Please refresh and try again.");
     }
   };
 
@@ -692,12 +774,19 @@ export default function CalibrationPage() {
   const moveToNextStep = async (nextStep: number) => {
     console.log(`Preparing to move to step ${nextStep} of ${workoutCount}`);
     
+    // Set loading state
+    setLoading(true);
+    
     try {
       // Update state first
       setCurrentStep(nextStep);
       
       // Clear captured image
       setCapturedImage(null);
+      
+      // Reset important states
+      setIsCapturing(false);
+      setCountdown(10);
       
       // Draw a simple message on canvas to indicate transition
       if (canvasRef.current) {
@@ -728,7 +817,12 @@ export default function CalibrationPage() {
       
       if (videoRestarted) {
         console.log("Video successfully restarted for next step");
-        // Already handled in the restartVideo function
+        
+        // Re-setup the canvas
+        setupCanvas();
+        
+        // Start pose detection again
+        startPoseDetection();
       } else {
         console.error("Failed to restart video for next step");
         // Try a fallback approach - just reinitialize the camera directly
@@ -753,12 +847,18 @@ export default function CalibrationPage() {
           
           if (videoRef.current) {
             videoRef.current.srcObject = stream;
-            videoRef.current.play().catch(err => {
+            await videoRef.current.play().catch(err => {
               console.error("Error playing video in fallback:", err);
+              throw err;
             });
+            
+            // Setup canvas and start detection
+            setupCanvas();
+            startPoseDetection();
           }
         } catch (err) {
           console.error("Fallback camera initialization failed:", err);
+          setCameraError("Failed to initialize camera. Please refresh and try again.");
         }
       }
       
@@ -774,259 +874,119 @@ export default function CalibrationPage() {
   };
 
   const saveWorkout = async () => {
-    // Add debugging to check required fields
-    console.log("Save workout triggered with:", {
-      planId,
-      hasUser: !!currentUser,
-      userId: currentUser?.uid,
-      hasImage: !!capturedImage,
-      imageLength: capturedImage ? capturedImage.substring(0, 20) + "..." : "null",
-      workoutName,
-      isSubmitting
-    });
+    console.log("saveWorkout called");
     
-    if (!planId) {
-      console.error("Missing planId");
-      setError("Missing plan ID. Please try again.");
-      return;
-    }
-    
-    if (!currentUser) {
-      console.error("No user is signed in");
-      setError("You must be signed in to save workouts.");
-      return;
-    }
-    
-    if (!capturedImage) {
-      console.error("No image captured");
-      setError("Please capture an image before saving.");
-      return;
-    }
-    
-    if (!workoutName || workoutName.trim() === "") {
-      console.error("Missing or empty workout name");
-      setError("Please enter a workout name.");
-      return;
-    }
-    
-    if (isSubmitting) {
-      console.warn("Already submitting, please wait...");
-      return;
-    }
-    
-    try {
-      // Set submitting state to true to prevent multiple clicks
-      setIsSubmitting(true);
-      setLoading(true);
-      
-      console.log("Starting save process for workout " + currentStep);
-      
-      // Stop the animation frame during save to avoid race conditions
-      if (animationFrameRef.current) {
-        console.log("Stopping animation frame during save");
-        cancelAnimationFrame(animationFrameRef.current);
-        animationFrameRef.current = null;
-      }
-      
-      // Upload image to Firebase Storage
-      if (!storage) {
-        console.error("Firebase storage is not initialized");
-        throw new Error("Firebase storage module not found");
-      }
-      
-      // Verify Firebase storage is working properly
-      console.log("Verifying Firebase storage", { 
-        hasStorage: !!storage,
-        hasRef: !!storage.ref,
-        storageBucket: storage.app.options.storageBucket 
+    if (!planId || !currentUser || !capturedImage || !workoutName || isSubmitting) {
+      console.error("Missing required data for saving workout", {
+        planId, currentUser: !!currentUser, capturedImage: !!capturedImage,
+        workoutName, isSubmitting
       });
+      return;
+    }
+
+    setIsSubmitting(true);
+    console.log("Starting to save workout");
+
+    try {
+      // Upload image to Firebase Storage
+      const storageRef = ref(storage, `workouts/${currentUser.uid}/${planId}/${Date.now()}.jpg`);
+      const snapshot = await uploadString(storageRef, capturedImage, 'data_url');
+      const photoURL = await getDownloadURL(snapshot.ref);
       
-      console.log("Uploading image to Firebase Storage");
-      const storageRef = storage.ref();
-      const imageRef = storageRef.child(`users/${currentUser.uid}/plans/${planId}/workouts/workout_${currentStep}.png`);
-      
-      // Convert data URL to blob
-      const response = await fetch(capturedImage);
-      const blob = await response.blob();
-      
-      // Upload the image
-      const uploadTask = await imageRef.put(blob);
-      const imageUrl = await uploadTask.ref.getDownloadURL();
-      console.log("Image uploaded successfully, URL:", imageUrl.substring(0, 50) + "...");
-      
-      // Save workout to Firestore
-      console.log("Saving workout data to Firestore");
+      console.log("Image uploaded successfully, URL:", photoURL);
+
+      // Prepare workout data for Firestore
       const workoutData = {
         name: workoutName,
-        imageUrl: imageUrl,
-        position: currentStep,
-        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        userId: currentUser.uid,
+        planId,
+        photoURL,
+        createdAt: new Date().toISOString(),
       };
-      
-      const workoutsRef = db.collection('users').doc(currentUser.uid)
-        .collection('plans').doc(planId)
-        .collection('workouts');
-      
-      const workoutDoc = await workoutsRef.add(workoutData);
-      console.log("Workout saved with ID:", workoutDoc.id);
-      
-      // EXTRACT LANDMARKS DIRECTLY HERE INSTEAD OF IN SEPARATE FUNCTION
-      console.log("Starting landmark extraction process");
-      
-      try {
-        // Create a new Image from capturedImage
-        const img = new Image();
+
+      // Save workout to Firestore
+      const workoutRef = await addDoc(collection(db, 'workouts'), workoutData);
+      console.log("Workout saved to Firestore, ID:", workoutRef.id);
+
+      // Save landmarks if available
+      if (poseLandmarkerRef.current && smoothedLandmarks.current.length > 0) {
+        console.log("Saving landmarks for pose comparison");
+        const landmarks = smoothedLandmarks.current[smoothedLandmarks.current.length - 1];
         
-        // Define what happens when image loads
-        await new Promise<void>((resolve, reject) => {
-          img.onload = () => {
-            console.log("Reference image loaded successfully:", {
-              width: img.width, 
-              height: img.height
-            });
-            resolve();
-          };
+        if (landmarks && landmarks.length > 0) {
+          // Format landmarks into a Firebase-friendly format
+          // Ensure we're creating simple serializable objects with only necessary properties
+          const formattedLandmarks = landmarks.map((landmark: {
+            index: number;
+            x: number;
+            y: number;
+            z: number;
+            visibility?: number;
+          }) => ({
+            index: landmark.index,
+            x: landmark.x,
+            y: landmark.y,
+            z: landmark.z,
+            visibility: landmark.visibility || 1.0
+          }));
+
+          await addDoc(collection(db, 'landmarks'), {
+            workoutId: workoutRef.id,
+            userId: currentUser.uid,
+            planId,
+            position: currentStep,
+            landmarks: formattedLandmarks,
+            createdAt: new Date().toISOString(),
+          });
           
-          img.onerror = (err) => {
-            console.error("Image failed to load:", err);
-            reject(err);
-          };
-          
-          // Set source to trigger loading
-          img.src = capturedImage;
-          
-          // Add timeout in case image never loads
-          setTimeout(() => {
-            console.log("Image load timeout triggered");
-            resolve();
-          }, 2000);
-        });
-        
-        // Create a temporary canvas
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = img.width || 640;  // Fallback size if image dimensions are zero
-        tempCanvas.height = img.height || 480;
-        
-        console.log("Created temp canvas with dimensions:", {
-          width: tempCanvas.width,
-          height: tempCanvas.height
-        });
-        
-        const tempCtx = tempCanvas.getContext('2d');
-        
-        if (tempCtx) {
-          // Draw the image to canvas
-          tempCtx.drawImage(img, 0, 0);
-          console.log("Drew image to temporary canvas");
-          
-          // Try to detect landmarks using IMAGE mode landmarker
-          if (imagePoseLandmarkerRef.current) {
-            try {
-              console.log("Using IMAGE mode landmarker for detection");
-              const results = await imagePoseLandmarkerRef.current.detect(tempCanvas);
-              
-              console.log("Detection results:", {
-                hasResults: !!results,
-                hasLandmarks: results?.landmarks ? true : false,
-                landmarkCount: results?.landmarks?.[0]?.length || 0
-              });
-              
-              if (results && results.landmarks && results.landmarks.length > 0) {
-                // Format landmarks for storage using the defined interface
-                const formattedLandmarks = results.landmarks[0].map((landmark, index: number): StoredPoseLandmark => {
-                  // Use type assertion to ensure landmark is treated as PoseLandmark
-                  const poseLandmark = landmark as PoseLandmark;
-                  return {
-                    index,
-                    x: parseFloat(poseLandmark.x.toFixed(5)),
-                    y: parseFloat(poseLandmark.y.toFixed(5)),
-                    z: parseFloat(poseLandmark.z.toFixed(5)),
-                    visibility: parseFloat((poseLandmark.visibility || 1).toFixed(5))
-                  };
-                });
-                
-                console.log(`Formatted ${formattedLandmarks.length} landmarks for storage`);
-                
-                // Store landmarks in Firestore
-                const landmarksData = {
-                  landmarks: formattedLandmarks,
-                  position: currentStep,
-                  workoutId: workoutDoc.id,
-                  workoutName: workoutName,
-                  planId: planId,
-                  userId: currentUser.uid,
-                  source: "image",
-                  createdAt: firebase.firestore.FieldValue.serverTimestamp()
-                };
-                
-                // Save to root collection
-                const landmarkDocRef = await db.collection('poseLandmarks').add(landmarksData);
-                
-                console.log("Saved landmarks to Firestore with ID:", landmarkDocRef.id);
-                
-                // Update workout with landmark reference
-                await workoutDoc.update({
-                  landmarksId: landmarkDocRef.id,
-                  landmarksCount: formattedLandmarks.length
-                });
-                
-                console.log("Updated workout with landmark reference");
-              } else {
-                console.warn("No landmarks detected in the image");
-              }
-            } catch (error) {
-              console.error("Error during landmark detection:", error);
-            }
-          } else {
-            console.warn("Image pose landmarker not initialized");
-          }
+          console.log("Landmarks saved successfully");
+        } else {
+          console.warn("No landmarks detected to save");
         }
-      } catch (landmarkError) {
-        console.error("Error in landmark extraction process:", landmarkError);
-        // Continue with the save process even if landmark extraction fails
-      }
-      
-      // If this is the first workout, use it as the plan thumbnail
-      if (currentStep === 1) {
-        console.log("Setting plan thumbnail image");
-        await db.collection('users').doc(currentUser.uid)
-          .collection('plans').doc(planId)
-          .update({ imageUrl: imageUrl });
-      }
-      
-      // Move to next step or finish
-      if (currentStep < workoutCount) {
-        // Prepare for next step
-        const nextStep = currentStep + 1;
-        
-        // First clear the state before moving to next step
-        setCapturedImage(null);
-        setWorkoutName("");
-        
-        console.log(`Moving to step ${nextStep} of ${workoutCount}`);
-        await moveToNextStep(nextStep);
       } else {
-        // All steps complete
-        console.log("All calibration steps complete!");
+        console.warn("No pose landmarker results available");
+      }
+
+      // If this is the first workout, update the plan thumbnail
+      const plansQuery = query(
+        collection(db, 'plans'),
+        where('id', '==', planId),
+        where('userId', '==', currentUser.uid)
+      );
+      
+      const planSnapshot = await getDocs(plansQuery);
+      
+      if (!planSnapshot.empty) {
+        const planDoc = planSnapshot.docs[0];
+        const planData = planDoc.data();
         
-        // Update plan with completion status
-        await db.collection('users').doc(currentUser.uid)
-          .collection('plans').doc(planId)
-          .update({ isCalibrated: true });
-        
-        // Reset the submitting state before redirecting
-        setIsSubmitting(false);
-        
-        // Redirect to plan details page
-        console.log("Redirecting to plan details page");
+        if (!planData.thumbnailURL) {
+          await firestoreUpdateDoc(doc(db, 'plans', planDoc.id), {
+            thumbnailURL: photoURL
+          });
+          console.log("Plan thumbnail updated");
+        }
+      }
+
+      toast.success(`Workout "${workoutName}" saved successfully!`);
+      
+      // If we have more steps, go to the next one
+      if (currentStep < workoutCount - 1) {
+        moveToNextStep(currentStep + 1);
+      } else {
+        console.log("Calibration complete! Redirecting to plan details");
+        // Otherwise, we're done with calibration
+        await firestoreUpdateDoc(doc(db, 'plans', planId), {
+          isCalibrated: true
+        });
         router.push(`/plans/${planId}`);
       }
-    } catch (err: any) {
-      console.error("Error saving workout:", err);
-      setError("Failed to save workout: " + err.message);
-      setLoading(false);
-      setIsSubmitting(false);  // Reset submitting state on error
+    } catch (error) {
+      console.error("Error saving workout:", error);
+      toast.error("Failed to save workout. Please try again.");
     }
+    
+    setIsSubmitting(false);
   };
 
   // Function to explicitly restart the video element
